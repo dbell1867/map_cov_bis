@@ -10,3 +10,6 @@ dependencies = [
     "altair>=5.0.0",
     "httpx>=0.27.0",
 ]
+
+[tool.marimo.runtime]
+output_max_bytes = 39_000_000

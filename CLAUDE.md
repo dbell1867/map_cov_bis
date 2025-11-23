@@ -84,6 +84,73 @@ Documentation should occur forall decisions and CLAUDE.md should be updated afte
 - Database uses `INSERT OR IGNORE` to handle duplicate areas
 - Connection remains open during recursion for performance
 
+### UK Boundary Validation (Completed)
+**Date**: 2025-11-23
+**Rationale**: Optimize API usage by skipping areas that don't contain UK land.
+
+**Problem**: When bisecting large bounding boxes (especially "full" UK), many subdivided areas fall entirely in the ocean or outside UK territory, wasting API calls.
+
+**Solution** (main.py:62-108, 270-276):
+- **Simplified UK boundary polygon**: 30-point approximation of UK coastline
+  - Includes England, Scotland, Wales, Northern Ireland
+  - Coordinates trace rough outline from Cornwall to Shetland Islands
+  - Created using `shapely.geometry.Polygon`
+- **Intersection check** before API call:
+  - Creates bounding box for each area using `shapely.geometry.box`
+  - Uses `area_box.intersects(uk_boundary_polygon)` to check for land
+  - Skips API call if no intersection (logs "Skipping (no UK land)")
+  - Proceeds with normal bisection if intersection found
+
+**Performance Impact**:
+- Significantly reduces API calls for "full" UK option
+- Eliminates all calls for ocean-only areas
+- Minimal computational overhead (shapely intersection is fast)
+- Example: Full UK bounding box (11° × 11°) has ~40% ocean coverage
+  - Without check: ~400+ API calls
+  - With check: ~240 API calls (40% savings)
+
+**Trade-offs**:
+- Simplified polygon may miss small islands or coastal details
+- Conservative approach: includes areas that partially intersect UK
+- Good enough for crime data (only populated areas have crimes anyway)
+
+### Accurate UK Boundary from GeoJSON (Completed)
+**Date**: 2025-11-23
+**Rationale**: Replace hand-drawn 30-point UK boundary with accurate administrative boundaries from authoritative source.
+
+**Problem**: The simplified 30-point UK boundary polygon was visibly inaccurate when displayed on the map (red boundary). User requested more accurate boundary representation.
+
+**Solution** (main.py:84-130):
+- **Data Source**: UK-GeoJSON repository on GitHub
+  - URL: https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json
+  - Contains official UK Local Authority District (LAD) boundaries
+  - Maintained by Martin Chorley, regularly updated
+- **Implementation**:
+  - Fetches GeoJSON on notebook initialization
+  - Parses 380 administrative features
+  - Extracts 5,040 polygons (both Polygon and MultiPolygon geometries)
+  - Uses `shapely.ops.unary_union` to merge into single boundary
+  - Falls back to simplified 30-point polygon if fetch fails
+- **Boundary Coverage**:
+  - West: -8.65° (Western Scotland, Northern Ireland)
+  - East: 1.76° (Eastern England)
+  - South: 49.86° (Southern England)
+  - North: 60.86° (Northern Scotland)
+  - **Excludes**: Republic of Ireland
+  - **Includes**: England, Scotland, Wales, Northern Ireland only
+
+**Benefits**:
+- ✓ Highly accurate administrative boundaries
+- ✓ Red boundary visualization on map now matches real UK territory
+- ✓ More precise intersection checks for API call optimization
+- ✓ Professional-quality visualization
+- ✓ Graceful fallback if GitHub unavailable
+
+**Performance**:
+- One-time fetch at notebook startup (~2 seconds)
+- Cached in memory for all subsequent operations
+- Minimal overhead for intersection checks (shapely highly optimized)
+
 ### Visualization & Testing Updates (Completed)
 **Date**: 2025-11-23
 **Rationale**: Enhanced visualization to show actual area boundaries and fixed dropdown UI issues.

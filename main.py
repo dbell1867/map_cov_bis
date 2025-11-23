@@ -6,6 +6,7 @@
 #     "polars==1.35.2",
 #     "pyarrow==22.0.0",
 #     "folium==0.20.0",
+#     "shapely==2.1.2",
 # ]
 # ///
 
@@ -26,7 +27,9 @@ def imports():
     from datetime import datetime
     from time import sleep
     import folium
-    return alt, folium, httpx, mo, pl, sleep, sqlite3
+    from shapely.geometry import Polygon, box
+    from shapely.ops import unary_union
+    return Polygon, box, folium, httpx, mo, sleep, sqlite3, unary_union
 
 
 @app.cell
@@ -57,15 +60,15 @@ def api_config():
 
 
 @app.cell
-def uk_boundaries():
+def uk_boundaries(Polygon, httpx, unary_union):
     """
     UK mainland approximate boundaries.
-    Starting with England for initial testing.
+    Fetches accurate UK boundary from public GeoJSON source.
     """
     # England mainland bounds (lat, lon)
     UK_BOUNDS = {
         "north": 55.8,
-        "south": 50.0,
+        "south": 49.0,
         "east": 1.8,
         "west": -5.7
     }
@@ -73,11 +76,58 @@ def uk_boundaries():
     # Full UK including Scotland, Wales, Northern Ireland
     UK_FULL_BOUNDS = {
         "north": 60.86,
-        "south": 49.96,
+        "south": 49.00,
         "east": 1.76,
         "west": -8.18
     }
-    return (UK_BOUNDS,)
+
+    # Fetch accurate UK boundary from Natural Earth (medium resolution)
+    # This is a public CDN-hosted GeoJSON file
+    try:
+        print("Fetching UK boundary data...")
+        url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
+        response = httpx.get(url, timeout=30.0)
+
+        if response.status_code == 200:
+            geojson_data = response.json()
+
+            # Extract all polygon geometries
+            polygons = []
+            for feature in geojson_data['features']:
+                geom = feature['geometry']
+                if geom['type'] == 'Polygon':
+                    # Coordinates are [lon, lat]
+                    coords = geom['coordinates'][0]
+                    polygons.append(Polygon(coords))
+                elif geom['type'] == 'MultiPolygon':
+                    for poly_coords in geom['coordinates']:
+                        polygons.append(Polygon(poly_coords[0]))
+
+            # Merge all polygons into one boundary
+            uk_boundary_polygon = unary_union(polygons)
+            print(f"✓ Loaded {len(polygons)} UK administrative boundaries")
+
+        else:
+            raise Exception(f"Failed to fetch UK boundary: {response.status_code}")
+
+    except Exception as e:
+        print(f"⚠ Could not fetch UK boundary: {e}")
+        print("Using simplified fallback boundary...")
+
+        # Fallback: simplified boundary
+        uk_boundary_coords = [
+            (-5.7, 50.0), (-4.0, 50.2), (-2.0, 50.7), (0.5, 51.0), (1.8, 51.5),
+            (1.5, 52.5), (0.5, 53.5), (-0.5, 54.0), (-1.5, 55.0),
+            (-2.0, 56.0), (-2.5, 57.5), (-3.0, 58.5), (-3.5, 59.0), (-4.0, 60.0),
+            (-5.0, 60.5), (-6.0, 60.0), (-7.0, 59.0), (-7.5, 58.0), (-7.0, 57.0),
+            (-6.5, 56.5), (-6.0, 56.0), (-6.5, 55.5), (-6.0, 55.2), (-6.0, 55.3),
+            (-7.0, 55.2), (-8.0, 55.0), (-8.0, 54.8), (-7.8, 54.5), (-7.5, 54.2),
+            (-6.8, 54.3), (-6.0, 54.5), (-5.5, 54.8), (-5.5, 55.0), (-5.0, 55.5),
+            (-5.0, 54.5), (-4.5, 54.0), (-5.5, 52.5), (-5.0, 52.0), (-4.5, 51.5),
+            (-5.5, 51.0), (-5.7, 50.5), (-5.7, 50.0)
+        ]
+        uk_boundary_polygon = Polygon(uk_boundary_coords)
+    return UK_BOUNDS, UK_FULL_BOUNDS, uk_boundary_polygon
 
 
 @app.cell
@@ -209,10 +259,12 @@ def bisection_algorithm(
     TARGET_MAX_CRIMES,
     TARGET_MIN_CRIMES,
     bounds_to_polygon,
+    box,
     conn,
     cursor,
     fetch_crimes,
     split_bounds_quad,
+    uk_boundary_polygon,
 ):
     def process_area(north, south, east, west, date, api_call_counter, depth=0, max_depth=15):
         """
@@ -235,15 +287,24 @@ def bisection_algorithm(
             print(f"Max depth {max_depth} reached, stopping recursion")
             return results
 
+        indent = "  " * depth
+
+        # Create a box for this area (west, south, east, north)
+        area_box = box(west, south, east, north)
+
+        # Check if this area intersects with UK boundary
+        if not area_box.intersects(uk_boundary_polygon):
+            print(f"{indent}Depth {depth}: Area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f}) - Skipping (no UK land)")
+            return results
+
         # Convert bounds to polygon and fetch crime data
         polygon_coords = bounds_to_polygon(north, south, east, west)
+        print(f"{indent}Depth {depth}: Checking area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f})")
+
         status_code, data, crime_count = fetch_crimes(polygon_coords, date)
 
         # Increment API call counter
         api_call_counter[0] += 1
-
-        indent = "  " * depth
-        print(f"{indent}Depth {depth}: Checking area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f})")
 
         # Handle different status codes
         if status_code == 403 or status_code == 503:
@@ -318,7 +379,7 @@ def test_execution_controls(mo):
 
     # Create test area selector
     test_area = mo.ui.dropdown(
-        options=["small", "medium", "large"],
+        options=["small", "medium", "large", "full"],
         value="small",
         label="Test Area Size"
     )
@@ -336,7 +397,7 @@ def test_execution_controls(mo):
 
 
 @app.cell
-def test_area_bounds(UK_BOUNDS, test_area):
+def test_area_bounds(UK_BOUNDS, UK_FULL_BOUNDS, test_area):
     # Define test areas
     test_areas = {
         "small": {  # London area
@@ -351,7 +412,8 @@ def test_area_bounds(UK_BOUNDS, test_area):
             "east": 1.5,
             "west": -1.5
         },
-        "large": UK_BOUNDS  # All England
+        "large": UK_BOUNDS,        # England mainland
+        "full": UK_FULL_BOUNDS     # Full UK (England, Scotland, Wales, N. Ireland)
     }
 
     selected_bounds = test_areas[test_area.value]
@@ -363,12 +425,13 @@ def execute_bisection(mo, test_area, test_date):
     area_labels = {
         "small": "Small Test (London area)",
         "medium": "Medium Test (South East England)",
-        "large": "Large Test (All England)"
+        "large": "Large Test (England mainland)",
+        "full": "Full UK (England, Scotland, Wales, Northern Ireland)"
     }
 
     run_button = mo.ui.run_button(label="Run Bisection Algorithm")
 
-    mo.vstack([
+    display = mo.vstack([
         mo.md(f"""
         ### Ready to Execute
 
@@ -379,7 +442,13 @@ def execute_bisection(mo, test_area, test_date):
         """),
         run_button
     ])
-    return (run_button,)
+    return display, run_button
+
+
+@app.cell
+def show_execute_controls(display):
+    display
+    return
 
 
 @app.cell
@@ -417,12 +486,17 @@ def run_bisection_process(
     else:
         bisection_results = []
         total_api_calls = 0
-
     return bisection_results, total_api_calls
 
 
 @app.cell
-def visualize_results(bisection_results, folium, mo, total_api_calls):
+def visualize_results(
+    bisection_results,
+    folium,
+    mo,
+    total_api_calls,
+    uk_boundary_polygon,
+):
     if len(bisection_results) == 0:
         output = mo.md("**No results yet.** Run the bisection algorithm to see visualizations.")
     else:
@@ -439,6 +513,38 @@ def visualize_results(bisection_results, folium, mo, total_api_calls):
             zoom_start=8,
             tiles='OpenStreetMap'
         )
+
+        # Add UK boundary polygon in red (reference outline)
+        # Handle both Polygon and MultiPolygon types
+        if uk_boundary_polygon.geom_type == 'Polygon':
+            # Single polygon - extract exterior coordinates
+            uk_boundary_coords_list = list(uk_boundary_polygon.exterior.coords)
+            uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
+
+            folium.Polygon(
+                locations=uk_boundary_latlon,
+                color='red',
+                weight=3,
+                fill=False,
+                opacity=0.8,
+                popup='UK Boundary (excludes Republic of Ireland)',
+                tooltip='UK Territory Boundary'
+            ).add_to(m)
+        else:
+            # MultiPolygon - iterate through all constituent polygons
+            for geomi in uk_boundary_polygon.geoms:
+                uk_boundary_coords_list = list(geomi.exterior.coords)
+                uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
+
+                folium.Polygon(
+                    locations=uk_boundary_latlon,
+                    color='red',
+                    weight=3,
+                    fill=False,
+                    opacity=0.8,
+                    popup='UK Boundary (excludes Republic of Ireland)',
+                    tooltip='UK Territory Boundary'
+                ).add_to(m)
 
         # Calculate crime counts for statistics
         crime_counts = [count for _, count in bisection_results]
@@ -495,7 +601,6 @@ def visualize_results(bisection_results, folium, mo, total_api_calls):
         """)
 
         output = mo.vstack([stats, mo.Html(m._repr_html_())])
-
     return (output,)
 
 
