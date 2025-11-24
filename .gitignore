@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Cache files (Phase 1 optimizations)
+uk_boundary_cache.pkl
+
+# Database files
+uk_crime_data.db

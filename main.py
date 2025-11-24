@@ -29,7 +29,7 @@ def imports():
     import folium
     from shapely.geometry import Polygon, box
     from shapely.ops import unary_union
-    return Polygon, box, folium, httpx, mo, sleep, sqlite3, unary_union
+    return Path, Polygon, box, folium, httpx, mo, sleep, sqlite3, unary_union
 
 
 @app.cell
@@ -50,6 +50,7 @@ def configuration(mo):
 
 @app.cell
 def api_config():
+    """API configuration constants."""
     API_BASE_URL = "https://data.police.uk/api/crimes-street/all-crime"
     MAX_CALLS_PER_SECOND = 10
     TARGET_MIN_CRIMES = 5000
@@ -60,11 +61,8 @@ def api_config():
 
 
 @app.cell
-def uk_boundaries(Polygon, httpx, unary_union):
-    """
-    UK mainland approximate boundaries.
-    Fetches accurate UK boundary from public GeoJSON source.
-    """
+def uk_boundary_constants():
+    """Define UK boundary box constants."""
     # England mainland bounds (lat, lon)
     UK_BOUNDS = {
         "north": 55.8,
@@ -80,66 +78,111 @@ def uk_boundaries(Polygon, httpx, unary_union):
         "east": 1.76,
         "west": -8.18
     }
+    return UK_BOUNDS, UK_FULL_BOUNDS
 
-    # Fetch accurate UK boundary from UK-GeoJSON repository
-    # This includes Great Britain (England, Scotland, Wales) + Northern Ireland
-    try:
-        print("Fetching UK boundary data...")
 
-        # Fetch Great Britain (England, Scotland, Wales)
-        gb_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
-        print("  - Fetching Great Britain boundaries...")
-        gb_response = httpx.get(gb_url, timeout=30.0)
+@app.cell
+def boundary_cache_functions(Path):
+    """Functions for loading and saving boundary cache."""
+    import pickle
 
-        # Fetch Northern Ireland
-        ni_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/ni/lgd.json"
-        print("  - Fetching Northern Ireland boundaries...")
-        ni_response = httpx.get(ni_url, timeout=30.0)
+    def load_boundary_from_cache():
+        """Load UK boundary from disk cache. Returns polygon or None."""
+        cache_path = Path("uk_boundary_cache.pkl")
+        if cache_path.exists():
+            try:
+                print("Loading UK boundary from cache...")
+                with open(cache_path, "rb") as f:
+                    boundary = pickle.load(f)
+                print("✓ Loaded UK boundary from cache (instant)")
+                return boundary
+            except Exception as e:
+                print(f"⚠ Cache load failed: {e}, will fetch fresh data...")
+                return None
+        return None
 
-        if gb_response.status_code == 200 and ni_response.status_code == 200:
-            # Extract polygons from Great Britain data
-            gb_data = gb_response.json()
-            polygons = []
+    def save_boundary_to_cache(boundary):
+        """Save UK boundary polygon to disk cache."""
+        cache_path = Path("uk_boundary_cache.pkl")
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(boundary, f)
+            print(f"✓ Saved boundary to cache: {cache_path}")
+        except Exception as e:
+            print(f"⚠ Could not save cache: {e}")
+    return load_boundary_from_cache, save_boundary_to_cache
 
-            for feature in gb_data['features']:
-                geom = feature['geometry']
-                if geom['type'] == 'Polygon':
-                    coords = geom['coordinates'][0]
-                    polygons.append(Polygon(coords))
-                elif geom['type'] == 'MultiPolygon':
-                    for poly_coords in geom['coordinates']:
-                        polygons.append(Polygon(poly_coords[0]))
 
-            gb_count = len(polygons)
-            print(f"  ✓ Loaded {gb_count} Great Britain boundaries")
+@app.cell
+def boundary_geojson_functions(Polygon):
+    """Functions for parsing GeoJSON boundary data."""
+    def extract_polygons_from_geojson(geojson_data):
+        """Extract polygon geometries from GeoJSON FeatureCollection."""
+        polygons = []
+        for feature in geojson_data['features']:
+            geom = feature['geometry']
+            if geom['type'] == 'Polygon':
+                coords = geom['coordinates'][0]
+                polygons.append(Polygon(coords))
+            elif geom['type'] == 'MultiPolygon':
+                for poly_coords in geom['coordinates']:
+                    polygons.append(Polygon(poly_coords[0]))
+        return polygons
+    return (extract_polygons_from_geojson,)
 
-            # Extract polygons from Northern Ireland data
-            ni_data = ni_response.json()
 
-            for feature in ni_data['features']:
-                geom = feature['geometry']
-                if geom['type'] == 'Polygon':
-                    coords = geom['coordinates'][0]
-                    polygons.append(Polygon(coords))
-                elif geom['type'] == 'MultiPolygon':
-                    for poly_coords in geom['coordinates']:
-                        polygons.append(Polygon(poly_coords[0]))
+@app.cell
+def fetch_uk_boundary_from_github(
+    extract_polygons_from_geojson,
+    httpx,
+    unary_union,
+):
+    """Fetch UK boundary data from GitHub GeoJSON repository."""
+    def fetch_boundary():
+        """Fetch and merge GB + NI boundaries. Returns polygon or None."""
+        try:
+            print("Fetching UK boundary data from GitHub...")
 
-            ni_count = len(polygons) - gb_count
-            print(f"  ✓ Loaded {ni_count} Northern Ireland boundaries")
+            # Fetch Great Britain (England, Scotland, Wales)
+            gb_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
+            print("  - Fetching Great Britain boundaries...")
+            gb_response = httpx.get(gb_url, timeout=30.0)
 
-            # Merge all polygons into one boundary
-            uk_boundary_polygon = unary_union(polygons)
-            print(f"✓ Total: {len(polygons)} UK administrative boundaries (GB + NI)")
+            # Fetch Northern Ireland
+            ni_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/ni/lgd.json"
+            print("  - Fetching Northern Ireland boundaries...")
+            ni_response = httpx.get(ni_url, timeout=30.0)
 
-        else:
-            raise Exception(f"Failed to fetch UK boundary: GB={gb_response.status_code}, NI={ni_response.status_code}")
+            if gb_response.status_code != 200 or ni_response.status_code != 200:
+                raise Exception(f"Failed to fetch: GB={gb_response.status_code}, NI={ni_response.status_code}")
 
-    except Exception as e:
-        print(f"⚠ Could not fetch UK boundary: {e}")
+            # Extract polygons from both datasets
+            gb_polygons = extract_polygons_from_geojson(gb_response.json())
+            print(f"  ✓ Loaded {len(gb_polygons)} Great Britain boundaries")
+
+            ni_polygons = extract_polygons_from_geojson(ni_response.json())
+            print(f"  ✓ Loaded {len(ni_polygons)} Northern Ireland boundaries")
+
+            # Merge all polygons
+            all_polygons = gb_polygons + ni_polygons
+            boundary = unary_union(all_polygons)
+            print(f"✓ Total: {len(all_polygons)} UK administrative boundaries (GB + NI)")
+
+            return boundary
+
+        except Exception as e:
+            print(f"⚠ Could not fetch UK boundary: {e}")
+            return None
+    return (fetch_boundary,)
+
+
+@app.cell
+def create_fallback_boundary(Polygon, unary_union):
+    """Create simplified fallback boundary when fetch fails."""
+    def get_fallback_boundary():
+        """Returns simplified UK boundary polygon."""
         print("Using simplified fallback boundary...")
 
-        # Fallback: simplified boundary including Northern Ireland
         # Main GB boundary (England, Scotland, Wales)
         gb_boundary_coords = [
             (-5.7, 50.0), (-4.0, 50.2), (-2.0, 50.7), (0.5, 51.0), (1.8, 51.5),
@@ -161,9 +204,39 @@ def uk_boundaries(Polygon, httpx, unary_union):
         # Create MultiPolygon for both regions
         gb_poly = Polygon(gb_boundary_coords)
         ni_poly = Polygon(ni_boundary_coords)
-        uk_boundary_polygon = unary_union([gb_poly, ni_poly])
+        boundary = unary_union([gb_poly, ni_poly])
         print(f"  ✓ Using fallback boundary (includes Northern Ireland)")
-    return UK_BOUNDS, UK_FULL_BOUNDS, uk_boundary_polygon
+
+        return boundary
+    return (get_fallback_boundary,)
+
+
+@app.cell
+def uk_boundaries(
+    fetch_boundary,
+    get_fallback_boundary,
+    load_boundary_from_cache,
+    save_boundary_to_cache,
+):
+    """
+    Main function to get UK boundary polygon with caching.
+    Tries cache first, then GitHub fetch, then fallback.
+    """
+    # Try loading from cache
+    uk_boundary_polygon = load_boundary_from_cache()
+
+    # If cache failed, fetch from GitHub
+    if uk_boundary_polygon is None:
+        uk_boundary_polygon = fetch_boundary()
+
+        # Save to cache if fetch succeeded
+        if uk_boundary_polygon is not None:
+            save_boundary_to_cache(uk_boundary_polygon)
+
+    # If fetch also failed, use fallback
+    if uk_boundary_polygon is None:
+        uk_boundary_polygon = get_fallback_boundary()
+    return (uk_boundary_polygon,)
 
 
 @app.cell
@@ -202,6 +275,31 @@ def database_setup(DB_PATH, sqlite3):
 
     conn.commit()
     return conn, cursor
+
+
+@app.cell
+def cache_functions(cursor):
+    def check_area_cached(polygon_str, date):
+        """
+        Check if area already processed for this date.
+        Returns crime_count if cached, None otherwise.
+        """
+        cursor.execute(
+            "SELECT crime_count FROM crime_areas WHERE polygon = ? AND date = ?",
+            (polygon_str, date)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else None
+
+    def get_cache_stats(date):
+        """Get statistics about cached areas for a date."""
+        cursor.execute(
+            "SELECT COUNT(*), SUM(crime_count) FROM crime_areas WHERE date = ?",
+            (date,)
+        )
+        result = cursor.fetchone()
+        return {"areas": result[0] or 0, "total_crimes": result[1] or 0}
+    return (check_area_cached,)
 
 
 @app.cell
@@ -296,13 +394,14 @@ def bisection_algorithm(
     TARGET_MIN_CRIMES,
     bounds_to_polygon,
     box,
+    check_area_cached,
     conn,
     cursor,
     fetch_crimes,
     split_bounds_quad,
     uk_boundary_polygon,
 ):
-    def process_area(north, south, east, west, date, api_call_counter, depth=0, max_depth=15):
+    def process_area(north, south, east, west, date, api_call_counter, results_buffer, cache_hits, depth=0, max_depth=15):
         """
         Recursively process an area using bisection strategy.
 
@@ -310,6 +409,8 @@ def bisection_algorithm(
             north, south, east, west: Bounding box coordinates
             date: Date string in YYYY-MM format
             api_call_counter: List with single element to track total API calls
+            results_buffer: List to collect results for batch commit
+            cache_hits: List with single element to track cache hits
             depth: Current recursion depth
             max_depth: Maximum recursion depth to prevent infinite loops
 
@@ -333,25 +434,33 @@ def bisection_algorithm(
             print(f"{indent}Depth {depth}: Area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f}) - Skipping (no UK land)")
             return results
 
-        # Convert bounds to polygon and fetch crime data
+        # Convert bounds to polygon
         polygon_coords = bounds_to_polygon(north, south, east, west)
-        print(f"{indent}Depth {depth}: Checking area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f})")
+        polygon_str = ":".join([f"{lat},{lon}" for lat, lon in polygon_coords])
 
+        # Check cache before making API call
+        cached_count = check_area_cached(polygon_str, date)
+        if cached_count is not None:
+            cache_hits[0] += 1
+            print(f"{indent}Depth {depth}: Area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f}) - ✓ CACHED ({cached_count} crimes)")
+            results.append((polygon_coords, cached_count))
+            return results
+
+        # Not cached, fetch from API
+        print(f"{indent}Depth {depth}: Checking area ({north:.3f}, {south:.3f}, {east:.3f}, {west:.3f})")
         status_code, data, crime_count = fetch_crimes(polygon_coords, date)
 
         # Increment API call counter
         api_call_counter[0] += 1
 
         # Handle different status codes
-        if status_code == 403 or status_code == 503:
-            # 403: Too many crimes (>10,000)
-            # 503: Service unavailable (might be due to area size)
-            # Both cases: try splitting into smaller areas
-            error_msg = "too many crimes" if status_code == 403 else "service unavailable"
+        if status_code == 503:
+            # 503: Service unavailable (crimes > 10000)
+            error_msg = "too many crimes" if status_code == 503 else "area size too large"
             print(f"{indent}  -> {status_code} Error ({error_msg}), splitting into 4 quadrants")
             quadrants = split_bounds_quad(north, south, east, west)
             for quad in quadrants:
-                results.extend(process_area(*quad, date, api_call_counter, depth + 1, max_depth))
+                results.extend(process_area(*quad, date, api_call_counter, results_buffer, cache_hits, depth + 1, max_depth))
 
         elif status_code == 200:
             # Success - check if crime count is in target range
@@ -362,39 +471,47 @@ def bisection_algorithm(
                 print(f"{indent}  -> Above target ({TARGET_MAX_CRIMES}), splitting")
                 quadrants = split_bounds_quad(north, south, east, west)
                 for quad in quadrants:
-                    results.extend(process_area(*quad, date, api_call_counter, depth + 1, max_depth))
+                    results.extend(process_area(*quad, date, api_call_counter, results_buffer, cache_hits, depth + 1, max_depth))
 
             elif crime_count >= TARGET_MIN_CRIMES:
-                # Perfect range! Save to database
-                print(f"{indent}  -> ✓ In target range ({TARGET_MIN_CRIMES}-{TARGET_MAX_CRIMES}), saving")
-                polygon_str = ":".join([f"{lat},{lon}" for lat, lon in polygon_coords])
+                # Perfect range! Add to batch buffer
+                print(f"{indent}  -> ✓ In target range ({TARGET_MIN_CRIMES}-{TARGET_MAX_CRIMES}), adding to batch")
+                results_buffer.append((polygon_str, crime_count, date))
+                results.append((polygon_coords, crime_count))
 
-                try:
-                    cursor.execute(
-                        """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
-                           VALUES (?, ?, ?)""",
-                        (polygon_str, crime_count, date)
-                    )
-                    conn.commit()
-                    results.append((polygon_coords, crime_count))
-                except Exception as e:
-                    print(f"{indent}  -> Error saving to DB: {e}")
+                # Batch commit every 50 areas
+                if len(results_buffer) >= 50:
+                    try:
+                        cursor.executemany(
+                            """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
+                               VALUES (?, ?, ?)""",
+                            results_buffer
+                        )
+                        conn.commit()
+                        print(f"{indent}  -> Batch committed {len(results_buffer)} areas")
+                        results_buffer.clear()
+                    except Exception as e:
+                        print(f"{indent}  -> Error in batch commit: {e}")
 
             else:
                 # Too few crimes, but save anyway for completeness
-                print(f"{indent}  -> Below target ({TARGET_MIN_CRIMES}), saving anyway")
-                polygon_str = ":".join([f"{lat},{lon}" for lat, lon in polygon_coords])
+                print(f"{indent}  -> Below target ({TARGET_MIN_CRIMES}), adding to batch")
+                results_buffer.append((polygon_str, crime_count, date))
+                results.append((polygon_coords, crime_count))
 
-                try:
-                    cursor.execute(
-                        """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
-                           VALUES (?, ?, ?)""",
-                        (polygon_str, crime_count, date)
-                    )
-                    conn.commit()
-                    results.append((polygon_coords, crime_count))
-                except Exception as e:
-                    print(f"{indent}  -> Error saving to DB: {e}")
+                # Batch commit every 50 areas
+                if len(results_buffer) >= 50:
+                    try:
+                        cursor.executemany(
+                            """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
+                               VALUES (?, ?, ?)""",
+                            results_buffer
+                        )
+                        conn.commit()
+                        print(f"{indent}  -> Batch committed {len(results_buffer)} areas")
+                        results_buffer.clear()
+                    except Exception as e:
+                        print(f"{indent}  -> Error in batch commit: {e}")
 
         else:
             # Other errors (500, timeout, etc.)
@@ -402,7 +519,7 @@ def bisection_algorithm(
             print(f"{indent}  -> Error {status_code}, trying to split anyway")
             quadrants = split_bounds_quad(north, south, east, west)
             for quad in quadrants:
-                results.extend(process_area(*quad, date, api_call_counter, depth + 1, max_depth))
+                results.extend(process_area(*quad, date, api_call_counter, results_buffer, cache_hits, depth + 1, max_depth))
 
         return results
     return (process_area,)
@@ -496,6 +613,8 @@ def show_execute_controls(display):
 
 @app.cell
 def run_bisection_process(
+    conn,
+    cursor,
     process_area,
     run_button,
     selected_bounds,
@@ -504,13 +623,15 @@ def run_bisection_process(
     run_button  # Create dependency
 
     if run_button.value:
-        print("Starting bisection algorithm...")
+        print("Starting bisection algorithm (with caching & batch commits)...")
         print(f"Date: {test_date.value}")
         print(f"Bounds: {selected_bounds}")
         print("-" * 60)
 
-        # Initialize API call counter (using list so it's mutable across recursion)
+        # Initialize counters and buffers
         api_call_counter = [0]
+        cache_hits = [0]
+        results_buffer = []  # For batch commits
 
         results = process_area(
             north=selected_bounds["north"],
@@ -519,17 +640,38 @@ def run_bisection_process(
             west=selected_bounds["west"],
             date=test_date.value,
             api_call_counter=api_call_counter,
+            results_buffer=results_buffer,
+            cache_hits=cache_hits,
         )
+
+        # Final batch commit for any remaining items
+        if results_buffer:
+            try:
+                cursor.executemany(
+                    """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
+                       VALUES (?, ?, ?)""",
+                    results_buffer
+                )
+                conn.commit()
+                print(f"Final batch committed {len(results_buffer)} areas")
+            except Exception as e:
+                print(f"Error in final batch commit: {e}")
 
         print("-" * 60)
         print(f"Completed! Found {len(results)} areas in target range.")
         print(f"Total API calls made: {api_call_counter[0]}")
+        print(f"Cache hits: {cache_hits[0]} (avoided {cache_hits[0]} API calls)")
+        if api_call_counter[0] + cache_hits[0] > 0:
+            cache_rate = cache_hits[0] / (api_call_counter[0] + cache_hits[0]) * 100
+            print(f"Cache hit rate: {cache_rate:.1f}%")
         bisection_results = results
         total_api_calls = api_call_counter[0]
+        total_cache_hits = cache_hits[0]
     else:
         bisection_results = []
         total_api_calls = 0
-    return bisection_results, total_api_calls
+        total_cache_hits = 0
+    return bisection_results, total_api_calls, total_cache_hits
 
 
 @app.cell
@@ -539,6 +681,7 @@ def visualize_results(
     mo,
     show_boundaries,
     total_api_calls,
+    total_cache_hits,
     uk_boundary_polygon,
 ):
     if len(bisection_results) == 0:
@@ -632,6 +775,10 @@ def visualize_results(
         total_crimes = sum(crime_counts)
         avg_crimes = total_crimes / len(crime_counts)
 
+        # Calculate cache rate
+        total_checks = total_api_calls + total_cache_hits
+        cache_rat = (total_cache_hits / total_checks * 100) if total_checks > 0 else 0
+
         stats = mo.md(f"""
         ### Results Summary
 
@@ -641,6 +788,7 @@ def visualize_results(
         - **Min Crimes**: {min_crimes}
         - **Max Crimes**: {max_crimes}
         - **API Calls Made**: {total_api_calls}
+        - **Cache Hits**: {total_cache_hits} ({cache_rat:.1f}% cache hit rate)
 
         **Map**: Blue polygons show bisected areas. Click for details, hover for quick stats.
         """)

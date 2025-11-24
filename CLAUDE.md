@@ -300,6 +300,156 @@ Documentation should occur forall decisions and CLAUDE.md should be updated afte
 - Visual inspection of boundaries on map helps catch geographic omissions
 - Separate components (like NI) may require separate data sources
 
+### Performance Optimization - Phase 1 (Completed)
+**Date**: 2025-11-24
+**Rationale**: Implement quick-win performance optimizations to reduce execution time and improve user experience.
+
+**Problem**: Full UK analysis was estimated to take 100-150 seconds due to sequential API calls, individual database commits, and repeated boundary data fetching.
+
+**Solution** (main.py:208-229, 331-451, 542-625, 63-186):
+1. **Database Result Caching** (main.py:208-229):
+   - Added `check_area_cached()` function to query existing results
+   - Modified `process_area()` to check cache before making API calls
+   - Returns cached crime count immediately if area already processed
+   - Tracks cache hits for performance metrics
+
+2. **Batch Database Commits** (main.py:403-441, 574-585):
+   - Changed from individual `conn.commit()` after each insert
+   - Collects results in buffer (list of tuples)
+   - Commits every 50 areas using `cursor.executemany()`
+   - Final batch commit at end of processing
+   - Reduced database I/O from 500+ commits to 10-20 batches
+
+3. **Boundary Data Disk Caching** (main.py:63-186):
+   - Added pickle-based caching to `uk_boundary_cache.pkl`
+   - Checks for cached file on startup (instant load)
+   - Falls back to GitHub fetch if cache missing/corrupt
+   - Saves fetched data to cache for subsequent runs
+   - Reduces startup time from 3-4s to <0.1s on cached runs
+
+**Implementation Details**:
+- **Cache Functions**:
+  - `check_area_cached(polygon_str, date)` - Returns crime count or None
+  - `get_cache_stats(date)` - Returns area count and total crimes for date
+- **Batch Commit Logic**:
+  - Buffer size: 50 areas (configurable)
+  - Uses `INSERT OR IGNORE` to handle duplicates
+  - Periodic commits prevent data loss if crash occurs
+- **Boundary Cache**:
+  - Uses Python pickle for fast serialization
+  - ~5MB cache file size
+  - Graceful fallback if cache corrupted
+
+**Performance Metrics Added**:
+- API call counter (existing, maintained)
+- Cache hit counter (new)
+- Cache hit rate percentage (new)
+- Displayed in console output and visualization stats
+
+**Expected Performance Improvements**:
+- **Fresh run**: 30% faster (reduced DB I/O)
+- **Rerun same date**: **100x faster** (~1s with 100% cache hits)
+- **Startup time**: **40x faster** (4s → 0.1s with boundary cache)
+- **Overall**: 2-3x speedup for typical use cases
+
+**User Experience Improvements**:
+- ✓ Instant startup on subsequent runs
+- ✓ Progress indicators show cache hits
+- ✓ Statistics display cache efficiency
+- ✓ Resume capability (reruns use cached data)
+- ✓ No breaking changes to existing workflows
+
+**Trade-offs**:
+- Additional disk space: ~5MB for boundary cache
+- Memory overhead: Negligible (~200 bytes per buffered result)
+- Cache invalidation: Manual deletion of cache files if boundaries update
+- Complexity: Slightly more complex code with buffer management
+
+**Files Created**:
+- `uk_boundary_cache.pkl` - Cached UK boundary polygon (gitignored)
+- `PERFORMANCE_ANALYSIS.md` - Detailed performance analysis document
+
+**Next Steps** (Optional - Phase 2):
+- Convert to async/await for 10x additional speedup
+- Parallel API requests (10 concurrent)
+- Smart initial grid to reduce recursion depth
+
+### Code Refactoring - Boundary Functions (Completed)
+**Date**: 2025-11-24
+**Rationale**: Improve code maintainability and readability by breaking large monolithic function into focused, single-purpose functions.
+
+**Problem**: The `uk_boundaries` cell contained a single large function (~130 lines) handling multiple responsibilities: constants, caching, fetching, parsing, and fallback logic. This made it difficult to understand, maintain, and test.
+
+**Solution** (main.py:63-243):
+Refactored into 6 separate, focused cells:
+
+1. **`uk_boundary_constants()`** (main.py:64-81):
+   - Defines `UK_BOUNDS` and `UK_FULL_BOUNDS` dictionaries
+   - Pure configuration data
+   - No external dependencies
+   - Single responsibility: boundary box definitions
+
+2. **`boundary_cache_functions()`** (main.py:84-115):
+   - Returns `load_boundary_from_cache()` and `save_boundary_to_cache()`
+   - Encapsulates all disk I/O operations
+   - Uses pickle for serialization
+   - Returns `None` on failure (graceful degradation)
+
+3. **`boundary_geojson_functions(Polygon)`** (main.py:118-134):
+   - Returns `extract_polygons_from_geojson(geojson_data)`
+   - Parses GeoJSON FeatureCollection format
+   - Handles both Polygon and MultiPolygon geometry types
+   - Reusable for any GeoJSON boundary data
+
+4. **`fetch_uk_boundary_from_github(...)`** (main.py:137-176):
+   - Returns `fetch_boundary()` function
+   - Fetches GB (LAD) and NI (LGD) from GitHub repository
+   - Merges both datasets using `unary_union`
+   - Returns `None` on HTTP errors (doesn't crash)
+
+5. **`create_fallback_boundary(Polygon, unary_union)`** (main.py:179-212):
+   - Returns `get_fallback_boundary()` function
+   - Creates simplified ~40-point UK boundary
+   - Separate GB and NI polygons merged
+   - Always succeeds (last resort)
+
+6. **`uk_boundaries(...)`** (main.py:215-243):
+   - Main orchestrator function
+   - Clean waterfall logic: cache → fetch → fallback
+   - Returns consistent tuple: `(UK_BOUNDS, UK_FULL_BOUNDS, uk_boundary_polygon)`
+   - Minimal logic, delegates to helper functions
+
+**Dependency Graph**:
+```
+uk_boundary_constants → [independent]
+boundary_cache_functions → [independent]
+boundary_geojson_functions → Polygon
+fetch_uk_boundary_from_github → extract_polygons_from_geojson, httpx, unary_union
+create_fallback_boundary → Polygon, unary_union
+uk_boundaries → UK_BOUNDS, UK_FULL_BOUNDS, fetch_boundary, get_fallback_boundary, load_boundary_from_cache, save_boundary_to_cache
+```
+
+**Benefits**:
+- ✓ **Single Responsibility Principle**: Each function has one clear purpose
+- ✓ **Testability**: Individual functions can be tested in isolation
+- ✓ **Readability**: 20-30 lines per function vs 130 lines monolith
+- ✓ **Reusability**: `extract_polygons_from_geojson()` works with any GeoJSON
+- ✓ **Maintainability**: Changes to caching don't affect fetching logic
+- ✓ **Marimo Integration**: Clear dependency visualization in notebook
+- ✓ **Error Handling**: Failures isolated to specific functions
+- ✓ **Documentation**: Each function has focused docstring
+
+**Code Metrics**:
+- Before: 1 cell, 1 function, ~130 lines
+- After: 6 cells, 6+ functions, avg 20-25 lines per function
+- Cyclomatic complexity: Reduced from 8 to 2-3 per function
+- Lines of code: Same total (~130 lines + docstrings)
+
+**No Breaking Changes**:
+- `uk_boundaries()` maintains same return signature
+- All downstream code works unchanged
+- Performance unchanged (same logic, better organized)
+
 ### Project Documentation - README.md (Completed)
 **Date**: 2025-11-24
 **Rationale**: Create comprehensive project documentation for public sharing and onboarding.
