@@ -249,6 +249,88 @@ Documentation should occur forall decisions and CLAUDE.md should be updated afte
 - Could be enhanced to multi-select if multiple boundary types added
 - Framework in place for dynamic boundary management
 
+### Northern Ireland Boundary Fix (Completed)
+**Date**: 2025-11-24
+**Rationale**: Correct critical omission of Northern Ireland from UK boundary data.
+
+**Problem**: The initial implementation fetched only Great Britain boundaries (England, Scotland, Wales) from `gb/lad.json`, inadvertently excluding Northern Ireland from the UK boundary. This was discovered during code review when user questioned whether Northern Ireland was included.
+
+**Root Cause**:
+- URL used contained "gb" (Great Britain) not "uk" (United Kingdom)
+- Great Britain ≠ United Kingdom (UK = GB + Northern Ireland)
+- Documentation incorrectly claimed Northern Ireland was included
+- No visual indication of the omission since NI is geographically separate
+
+**Solution** (main.py:84-166):
+- **Dual Data Fetch**:
+  - First request: Great Britain LAD boundaries (`gb/lad.json`)
+  - Second request: Northern Ireland LGD boundaries (`ni/lgd.json`)
+  - Both fetched in parallel during initialization
+- **Merged Boundary**:
+  - Extract polygons from both GeoJSON responses
+  - Combine into single polygon list (~391 total districts)
+  - Use `unary_union` to create unified UK boundary polygon
+  - Handles both Polygon and MultiPolygon geometry types
+- **Enhanced Fallback**:
+  - Separate coordinate arrays for GB and NI regions
+  - Creates two Polygon objects
+  - Merges with `unary_union` to form MultiPolygon
+  - Ensures Northern Ireland included even if fetch fails
+- **Progress Logging**:
+  - Reports GB boundary count separately
+  - Reports NI boundary count separately
+  - Shows total UK boundaries loaded
+
+**Verification**:
+- Code syntax validated with `python -m py_compile`
+- Northern Ireland coordinates: lon -8.18° to -5.4°, lat 54.0° to 55.3°
+- Fallback includes 12-point NI polygon approximation
+- Both primary and fallback methods include Northern Ireland
+
+**Impact**:
+- ✓ **Complete UK coverage** for intersection checks (was missing ~1.8M people)
+- ✓ Accurate boundary visualization includes all UK territory
+- ✓ Northern Ireland crime data will now be properly processed
+- ✓ Documentation updated to reflect actual implementation
+- ✓ No breaking changes to existing functionality
+
+**Lessons Learned**:
+- Always verify data source URLs match intended geographic scope
+- Great Britain (gb) vs United Kingdom (uk) distinction is critical
+- Visual inspection of boundaries on map helps catch geographic omissions
+- Separate components (like NI) may require separate data sources
+
+### Project Documentation - README.md (Completed)
+**Date**: 2025-11-24
+**Rationale**: Create comprehensive project documentation for public sharing and onboarding.
+
+**Content Created** (README.md):
+- **Project Overview**: Brief description of bisection algorithm approach
+- **Key Features**: List of main capabilities and benefits
+- **Technologies Used**: Detailed list with links to all major libraries:
+  - Core: Python, Marimo, Polars, SQLite
+  - Geospatial: Folium, Shapely, Altair
+  - HTTP: httpx, PyArrow
+- **Data Sources & Credits**:
+  - UK-GeoJSON repository by Martin Chorley (with link)
+  - Police UK Data API (with link)
+  - Proper attribution to ONS, Ordnance Survey, OSNI
+- **Installation Instructions**: Step-by-step setup using uv or pip
+- **Usage Guide**: Interactive controls explanation and algorithm parameters
+- **Project Structure**: File organization overview
+- **Database Schema**: Documentation of tables and columns
+- **Algorithm Details**: High-level flow explanation
+- **Acknowledgments**: Credits to all data providers and library maintainers
+- **License Information**: Notes about data source licenses
+- **Future Work**: Planned enhancements
+
+**Benefits**:
+- ✓ Professional project presentation for GitHub
+- ✓ Proper attribution to all open-source projects used
+- ✓ Clear installation and usage instructions
+- ✓ Helps new contributors understand project structure
+- ✓ Documents technology stack for future reference
+
 ##Problem to analyse
 Create a strategy for database creation of all Crimes reported in the UK by downloading crime data from a government provided ability
 The format of the API call should follow https://data.police.uk/api/crimes-street/all-crime?date=2024-01&poly=52.268,0.543:52.794,0.238:52.130,0.478 where poly is latitude and longitude pairs.
