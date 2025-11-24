@@ -81,52 +81,88 @@ def uk_boundaries(Polygon, httpx, unary_union):
         "west": -8.18
     }
 
-    # Fetch accurate UK boundary from Natural Earth (medium resolution)
-    # This is a public CDN-hosted GeoJSON file
+    # Fetch accurate UK boundary from UK-GeoJSON repository
+    # This includes Great Britain (England, Scotland, Wales) + Northern Ireland
     try:
         print("Fetching UK boundary data...")
-        url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
-        response = httpx.get(url, timeout=30.0)
 
-        if response.status_code == 200:
-            geojson_data = response.json()
+        # Fetch Great Britain (England, Scotland, Wales)
+        gb_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
+        print("  - Fetching Great Britain boundaries...")
+        gb_response = httpx.get(gb_url, timeout=30.0)
 
-            # Extract all polygon geometries
+        # Fetch Northern Ireland
+        ni_url = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/ni/lgd.json"
+        print("  - Fetching Northern Ireland boundaries...")
+        ni_response = httpx.get(ni_url, timeout=30.0)
+
+        if gb_response.status_code == 200 and ni_response.status_code == 200:
+            # Extract polygons from Great Britain data
+            gb_data = gb_response.json()
             polygons = []
-            for feature in geojson_data['features']:
+
+            for feature in gb_data['features']:
                 geom = feature['geometry']
                 if geom['type'] == 'Polygon':
-                    # Coordinates are [lon, lat]
                     coords = geom['coordinates'][0]
                     polygons.append(Polygon(coords))
                 elif geom['type'] == 'MultiPolygon':
                     for poly_coords in geom['coordinates']:
                         polygons.append(Polygon(poly_coords[0]))
 
+            gb_count = len(polygons)
+            print(f"  ✓ Loaded {gb_count} Great Britain boundaries")
+
+            # Extract polygons from Northern Ireland data
+            ni_data = ni_response.json()
+
+            for feature in ni_data['features']:
+                geom = feature['geometry']
+                if geom['type'] == 'Polygon':
+                    coords = geom['coordinates'][0]
+                    polygons.append(Polygon(coords))
+                elif geom['type'] == 'MultiPolygon':
+                    for poly_coords in geom['coordinates']:
+                        polygons.append(Polygon(poly_coords[0]))
+
+            ni_count = len(polygons) - gb_count
+            print(f"  ✓ Loaded {ni_count} Northern Ireland boundaries")
+
             # Merge all polygons into one boundary
             uk_boundary_polygon = unary_union(polygons)
-            print(f"✓ Loaded {len(polygons)} UK administrative boundaries")
+            print(f"✓ Total: {len(polygons)} UK administrative boundaries (GB + NI)")
 
         else:
-            raise Exception(f"Failed to fetch UK boundary: {response.status_code}")
+            raise Exception(f"Failed to fetch UK boundary: GB={gb_response.status_code}, NI={ni_response.status_code}")
 
     except Exception as e:
         print(f"⚠ Could not fetch UK boundary: {e}")
         print("Using simplified fallback boundary...")
 
-        # Fallback: simplified boundary
-        uk_boundary_coords = [
+        # Fallback: simplified boundary including Northern Ireland
+        # Main GB boundary (England, Scotland, Wales)
+        gb_boundary_coords = [
             (-5.7, 50.0), (-4.0, 50.2), (-2.0, 50.7), (0.5, 51.0), (1.8, 51.5),
             (1.5, 52.5), (0.5, 53.5), (-0.5, 54.0), (-1.5, 55.0),
             (-2.0, 56.0), (-2.5, 57.5), (-3.0, 58.5), (-3.5, 59.0), (-4.0, 60.0),
             (-5.0, 60.5), (-6.0, 60.0), (-7.0, 59.0), (-7.5, 58.0), (-7.0, 57.0),
-            (-6.5, 56.5), (-6.0, 56.0), (-6.5, 55.5), (-6.0, 55.2), (-6.0, 55.3),
-            (-7.0, 55.2), (-8.0, 55.0), (-8.0, 54.8), (-7.8, 54.5), (-7.5, 54.2),
-            (-6.8, 54.3), (-6.0, 54.5), (-5.5, 54.8), (-5.5, 55.0), (-5.0, 55.5),
-            (-5.0, 54.5), (-4.5, 54.0), (-5.5, 52.5), (-5.0, 52.0), (-4.5, 51.5),
-            (-5.5, 51.0), (-5.7, 50.5), (-5.7, 50.0)
+            (-6.5, 56.5), (-6.0, 56.0), (-6.5, 55.5), (-6.0, 55.2),
+            (-5.0, 55.5), (-5.0, 54.5), (-4.5, 54.0), (-5.5, 52.5), (-5.0, 52.0),
+            (-4.5, 51.5), (-5.5, 51.0), (-5.7, 50.5), (-5.7, 50.0)
         ]
-        uk_boundary_polygon = Polygon(uk_boundary_coords)
+
+        # Northern Ireland boundary (approximate)
+        ni_boundary_coords = [
+            (-8.18, 54.0), (-8.0, 54.4), (-7.5, 54.9), (-7.0, 55.2),
+            (-6.5, 55.3), (-6.0, 55.3), (-5.4, 55.0), (-5.4, 54.5),
+            (-5.8, 54.2), (-6.5, 54.0), (-7.5, 54.0), (-8.18, 54.0)
+        ]
+
+        # Create MultiPolygon for both regions
+        gb_poly = Polygon(gb_boundary_coords)
+        ni_poly = Polygon(ni_boundary_coords)
+        uk_boundary_polygon = unary_union([gb_poly, ni_poly])
+        print(f"  ✓ Using fallback boundary (includes Northern Ireland)")
     return UK_BOUNDS, UK_FULL_BOUNDS, uk_boundary_polygon
 
 
@@ -384,6 +420,12 @@ def test_execution_controls(mo):
         label="Test Area Size"
     )
 
+    # Create boundary display toggle
+    show_boundaries = mo.ui.checkbox(
+        value=True,
+        label="Show UK boundary on map"
+    )
+
     mo.vstack([
         mo.md("""
         ## Execution Controls
@@ -391,9 +433,10 @@ def test_execution_controls(mo):
         Test the bisection algorithm on a small area before running on the entire UK.
         """),
         test_date,
-        test_area
+        test_area,
+        show_boundaries
     ])
-    return test_area, test_date
+    return show_boundaries, test_area, test_date
 
 
 @app.cell
@@ -494,6 +537,7 @@ def visualize_results(
     bisection_results,
     folium,
     mo,
+    show_boundaries,
     total_api_calls,
     uk_boundary_polygon,
 ):
@@ -514,26 +558,12 @@ def visualize_results(
             tiles='OpenStreetMap'
         )
 
-        # Add UK boundary polygon in red (reference outline)
-        # Handle both Polygon and MultiPolygon types
-        if uk_boundary_polygon.geom_type == 'Polygon':
-            # Single polygon - extract exterior coordinates
-            uk_boundary_coords_list = list(uk_boundary_polygon.exterior.coords)
-            uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
-
-            folium.Polygon(
-                locations=uk_boundary_latlon,
-                color='red',
-                weight=3,
-                fill=False,
-                opacity=0.8,
-                popup='UK Boundary (excludes Republic of Ireland)',
-                tooltip='UK Territory Boundary'
-            ).add_to(m)
-        else:
-            # MultiPolygon - iterate through all constituent polygons
-            for geomi in uk_boundary_polygon.geoms:
-                uk_boundary_coords_list = list(geomi.exterior.coords)
+        # Conditionally add UK boundary polygon in red (reference outline)
+        if show_boundaries.value:
+            # Handle both Polygon and MultiPolygon types
+            if uk_boundary_polygon.geom_type == 'Polygon':
+                # Single polygon - extract exterior coordinates
+                uk_boundary_coords_list = list(uk_boundary_polygon.exterior.coords)
                 uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
 
                 folium.Polygon(
@@ -545,6 +575,21 @@ def visualize_results(
                     popup='UK Boundary (excludes Republic of Ireland)',
                     tooltip='UK Territory Boundary'
                 ).add_to(m)
+            else:
+                # MultiPolygon - iterate through all constituent polygons
+                for geomi in uk_boundary_polygon.geoms:
+                    uk_boundary_coords_list = list(geomi.exterior.coords)
+                    uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
+
+                    folium.Polygon(
+                        locations=uk_boundary_latlon,
+                        color='red',
+                        weight=3,
+                        fill=False,
+                        opacity=0.8,
+                        popup='UK Boundary (excludes Republic of Ireland)',
+                        tooltip='UK Territory Boundary'
+                    ).add_to(m)
 
         # Calculate crime counts for statistics
         crime_counts = [count for _, count in bisection_results]

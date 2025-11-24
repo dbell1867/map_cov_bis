@@ -115,39 +115,42 @@ Documentation should occur forall decisions and CLAUDE.md should be updated afte
 - Good enough for crime data (only populated areas have crimes anyway)
 
 ### Accurate UK Boundary from GeoJSON (Completed)
-**Date**: 2025-11-23
+**Date**: 2025-11-23 (Updated: 2025-11-24)
 **Rationale**: Replace hand-drawn 30-point UK boundary with accurate administrative boundaries from authoritative source.
 
 **Problem**: The simplified 30-point UK boundary polygon was visibly inaccurate when displayed on the map (red boundary). User requested more accurate boundary representation.
 
-**Solution** (main.py:84-130):
-- **Data Source**: UK-GeoJSON repository on GitHub
-  - URL: https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json
-  - Contains official UK Local Authority District (LAD) boundaries
+**Solution** (main.py:84-166):
+- **Data Sources**: UK-GeoJSON repository on GitHub
+  - **Great Britain**: `json/administrative/gb/lad.json` - Local Authority Districts
+  - **Northern Ireland**: `json/administrative/ni/lgd.json` - Local Government Districts
   - Maintained by Martin Chorley, regularly updated
+  - Note: GB and NI have different naming conventions (LAD vs LGD)
 - **Implementation**:
-  - Fetches GeoJSON on notebook initialization
-  - Parses 380 administrative features
-  - Extracts 5,040 polygons (both Polygon and MultiPolygon geometries)
-  - Uses `shapely.ops.unary_union` to merge into single boundary
-  - Falls back to simplified 30-point polygon if fetch fails
+  - Fetches both GB and NI GeoJSON files on notebook initialization (separate requests)
+  - Parses ~380 GB features + ~11 NI features
+  - Extracts polygons from both datasets (handles Polygon and MultiPolygon geometries)
+  - Uses `shapely.ops.unary_union` to merge all polygons into single UK boundary
+  - Falls back to simplified multi-polygon if fetch fails (includes separate NI polygon)
 - **Boundary Coverage**:
-  - West: -8.65° (Western Scotland, Northern Ireland)
+  - West: -8.18° (Western Northern Ireland)
   - East: 1.76° (Eastern England)
-  - South: 49.86° (Southern England)
+  - South: 49.00° (Southern England)
   - North: 60.86° (Northern Scotland)
   - **Excludes**: Republic of Ireland
-  - **Includes**: England, Scotland, Wales, Northern Ireland only
+  - **Includes**: England, Scotland, Wales, **Northern Ireland** ✓
 
 **Benefits**:
-- ✓ Highly accurate administrative boundaries
+- ✓ Highly accurate administrative boundaries for entire UK
+- ✓ Northern Ireland properly included (was missing in initial implementation)
 - ✓ Red boundary visualization on map now matches real UK territory
 - ✓ More precise intersection checks for API call optimization
 - ✓ Professional-quality visualization
-- ✓ Graceful fallback if GitHub unavailable
+- ✓ Graceful fallback if GitHub unavailable (includes NI in fallback)
 
 **Performance**:
-- One-time fetch at notebook startup (~2 seconds)
+- Two HTTP fetches at notebook startup (~3-4 seconds total)
+- GB file: ~2.5 MB, NI file: ~17.7 MB
 - Cached in memory for all subsequent operations
 - Minimal overhead for intersection checks (shapely highly optimized)
 
@@ -215,6 +218,36 @@ Documentation should occur forall decisions and CLAUDE.md should be updated afte
 - ✓ OpenStreetMap basemap shows streets, cities, geography
 - ✓ Color-coded visualization of crime density
 - ✓ Shows exact bisection coverage pattern
+
+### Configurable Boundary Display (Completed)
+**Date**: 2025-11-24
+**Rationale**: Provide user control over boundary visualization for flexibility and future extensibility.
+
+**Problem**: The UK boundary was always displayed on the map (red outline). As the project may include additional boundaries in the future (e.g., regional boundaries, administrative zones), users need the ability to toggle boundary visibility on/off.
+
+**Solution** (main.py:388-391, 526):
+- **UI Control** (main.py:388-391):
+  - Added `show_boundaries` checkbox in execution controls
+  - Default value: `True` (boundaries shown by default)
+  - Label: "Show UK boundary on map"
+  - Checkbox state persists during session
+- **Conditional Rendering** (main.py:526):
+  - Modified `visualize_results()` function to accept `show_boundaries` parameter
+  - UK boundary polygon only rendered when `show_boundaries.value == True`
+  - No changes to boundary data loading or intersection checks (those still run)
+  - Clean map display when checkbox unchecked (only bisected areas shown)
+
+**Benefits**:
+- ✓ User control over map visualization
+- ✓ Cleaner map view when boundaries not needed
+- ✓ Extensible: can add more boundary types with similar toggles in future
+- ✓ No performance impact (boundary data still used for intersection checks)
+- ✓ Maintains backward compatibility (default is to show boundaries)
+
+**Future Extensibility**:
+- Pattern established for adding other boundary toggles (e.g., "Show regional boundaries", "Show city limits")
+- Could be enhanced to multi-select if multiple boundary types added
+- Framework in place for dynamic boundary management
 
 ##Problem to analyse
 Create a strategy for database creation of all Crimes reported in the UK by downloading crime data from a government provided ability
