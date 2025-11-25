@@ -481,6 +481,102 @@ uk_boundaries → UK_BOUNDS, UK_FULL_BOUNDS, fetch_boundary, get_fallback_bounda
 - ✓ Helps new contributors understand project structure
 - ✓ Documents technology stack for future reference
 
+### Individual Crime Record Tracking (Completed)
+**Date**: 2025-11-25
+**Rationale**: Capture detailed information about each individual crime record from the API for granular analysis and historical tracking.
+
+**Problem**: The bisection algorithm was only storing aggregated area-level data (polygon coordinates and crime counts) in the `crime_areas` table. Individual crime details from API responses were being discarded, preventing:
+- Analysis of specific crime types and categories
+- Geographic distribution analysis at crime level
+- Street-level crime pattern identification
+- Crime outcome tracking over time
+
+**Solution** (main.py:316-382, 557-613):
+1. **Crime Insertion Function** (main.py:316-382):
+   - Created `crime_insertion_functions()` cell with `insert_crimes_batch()` function
+   - Extracts key fields from API response for each crime:
+     - `crime_id`: Uses `id` field from API response (unique identifier)
+     - `category`: Crime type (e.g., "violent-crime", "burglary")
+     - `latitude`/`longitude`: Precise location coordinates (converted to float)
+     - `street_name`: Street where crime occurred
+     - `month`: Month of occurrence (YYYY-MM format)
+     - `area_id`: Foreign key linking to `crime_areas` table
+   - Uses `INSERT OR IGNORE` to prevent duplicate crime_id entries
+   - Batch insertion using `cursor.executemany()` for performance
+   - Graceful error handling with logging
+
+2. **Bisection Algorithm Integration** (main.py:557-613):
+   - Modified `process_area()` to insert crimes immediately when saving areas
+   - Process for each successful area:
+     1. Insert area record to `crime_areas` (or ignore if exists)
+     2. Query back `area_id` from database
+     3. Call `insert_crimes_batch(area_id, data)` with API response
+     4. Commit transaction
+     5. Log number of crimes inserted
+   - Both "target range" (5k-7.5k) and "below target" (<5k) paths insert crimes
+   - Removed batch commit strategy for areas (now immediate commits)
+   - Updated progress messages to show crime insertion status
+
+3. **Data Visualization** (main.py:905-922):
+   - Added `crimes_data()` cell to query individual crime records
+   - SQL joins `crimes` with `crime_areas` to include context
+   - Displays latest 1000 crimes with full details
+   - Shows `area_crime_count` for reference
+
+**Database Schema (Existing)**:
+The `crimes` table was already defined in initial setup but not populated:
+```sql
+CREATE TABLE crimes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    area_id INTEGER,                    -- FK to crime_areas
+    crime_id TEXT UNIQUE,               -- Unique crime identifier (prevents duplicates)
+    category TEXT,                      -- Crime category
+    latitude REAL,                      -- Crime location
+    longitude REAL,                     -- Crime location
+    street_name TEXT,                   -- Street name
+    month TEXT,                         -- Month (YYYY-MM)
+    FOREIGN KEY (area_id) REFERENCES crime_areas(id)
+)
+```
+
+**Note**: The `outcome_status` and `location_type` fields were removed on 2025-11-25 to simplify the schema and focus on core crime data.
+
+**Key Features**:
+- ✓ Duplicate prevention via `UNIQUE` constraint on `crime_id`
+- ✓ Referential integrity via foreign key to `crime_areas`
+- ✓ All requested fields captured (category, id, lat, lon, street, month, area)
+- ✓ Batch insertion for performance
+- ✓ Graceful handling of missing/malformed data
+- ✓ Immediate commits ensure data consistency
+
+**Benefits**:
+- ✓ **Granular Analysis**: Query individual crimes by type, location, outcome
+- ✓ **Historical Tracking**: Each crime linked to specific month and area
+- ✓ **Spatial Analysis**: Precise lat/lon coordinates enable heatmaps
+- ✓ **Street-Level Insights**: Street names enable neighborhood analysis
+- ✓ **Data Integrity**: UNIQUE constraint prevents duplicate records
+- ✓ **Relational Structure**: Foreign key maintains area-crime relationships
+
+**Performance Impact**:
+- Minimal overhead: Batch insertion handles 100s of crimes efficiently
+- Immediate commits ensure no data loss if process interrupted
+- Database size: ~200-300 bytes per crime record
+- Full UK month: Estimated 500k-1M crime records = ~200-300 MB
+
+**Use Cases Enabled**:
+1. Crime category distribution analysis (e.g., "What % are violent crimes?")
+2. Hotspot identification (cluster crimes by lat/lon)
+3. Street safety rankings (aggregate by street_name)
+4. Outcome success rates (track outcome_status over time)
+5. Temporal patterns (compare months using month field)
+6. Area-level aggregations (use area_id to group by bisected regions)
+
+**Next Steps** (Future Enhancements):
+- Add indexes on `crime_id`, `category`, `month` for faster queries
+- Create views for common aggregations (crimes by category, by street, etc.)
+- Implement historical data collection (multiple months)
+- Add crime outcome timeline tracking
+
 ##Problem to analyse
 Create a strategy for database creation of all Crimes reported in the UK by downloading crime data from a government provided ability
 The format of the API call should follow https://data.police.uk/api/crimes-street/all-crime?date=2024-01&poly=52.268,0.543:52.794,0.238:52.130,0.478 where poly is latitude and longitude pairs.

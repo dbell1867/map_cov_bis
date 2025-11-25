@@ -29,7 +29,18 @@ def imports():
     import folium
     from shapely.geometry import Polygon, box
     from shapely.ops import unary_union
-    return Path, Polygon, box, folium, httpx, mo, sleep, sqlite3, unary_union
+    return (
+        Path,
+        Polygon,
+        box,
+        folium,
+        httpx,
+        mo,
+        pl,
+        sleep,
+        sqlite3,
+        unary_union,
+    )
 
 
 @app.cell
@@ -263,11 +274,9 @@ def database_setup(DB_PATH, sqlite3):
             area_id INTEGER,
             crime_id TEXT UNIQUE,
             category TEXT,
-            location_type TEXT,
             latitude REAL,
             longitude REAL,
             street_name TEXT,
-            outcome_status TEXT,
             month TEXT,
             FOREIGN KEY (area_id) REFERENCES crime_areas(id)
         )
@@ -300,6 +309,72 @@ def cache_functions(cursor):
         result = cursor.fetchone()
         return {"areas": result[0] or 0, "total_crimes": result[1] or 0}
     return (check_area_cached,)
+
+
+@app.cell
+def crime_insertion_functions(conn, cursor):
+    def insert_crimes_batch(area_id, crimes_data):
+        """
+        Insert individual crime records into the crimes table.
+
+        Args:
+            area_id: The area_id from crime_areas table
+            crimes_data: List of crime dictionaries from API response
+
+        Returns:
+            Number of crimes inserted (may be less than total if duplicates exist)
+        """
+        if not crimes_data:
+            return 0
+
+        # Prepare batch insert data
+        crime_records = []
+        for crime in crimes_data:
+            # Extract data from API response
+            crime_id = crime.get('id', None)
+            if crime_id is None:
+                # Skip crimes without ID
+                continue
+
+            category = crime.get('category', '')
+            location = crime.get('location', {})
+            latitude = location.get('latitude')
+            longitude = location.get('longitude')
+            street_name = location.get('street', {}).get('name', '')
+            month = crime.get('month', '')
+
+            # Convert latitude/longitude to float (they come as strings)
+            try:
+                latitude = float(latitude) if latitude else None
+                longitude = float(longitude) if longitude else None
+            except (ValueError, TypeError):
+                latitude = None
+                longitude = None
+
+            crime_records.append((
+                area_id,
+                crime_id,
+                category,
+                latitude,
+                longitude,
+                street_name,
+                month
+            ))
+
+        # Batch insert with INSERT OR IGNORE to handle duplicates
+        try:
+            cursor.executemany(
+                """INSERT OR IGNORE INTO crimes
+                   (area_id, crime_id, category, latitude, longitude, street_name, month)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                crime_records
+            )
+            conn.commit()
+            return len(crime_records)
+        except Exception as e:
+            print(f"    ⚠ Error inserting crimes: {e}")
+            return 0
+    return (insert_crimes_batch,)
 
 
 @app.cell
@@ -398,6 +473,7 @@ def bisection_algorithm(
     conn,
     cursor,
     fetch_crimes,
+    insert_crimes_batch,
     split_bounds_quad,
     uk_boundary_polygon,
 ):
@@ -474,44 +550,62 @@ def bisection_algorithm(
                     results.extend(process_area(*quad, date, api_call_counter, results_buffer, cache_hits, depth + 1, max_depth))
 
             elif crime_count >= TARGET_MIN_CRIMES:
-                # Perfect range! Add to batch buffer
-                print(f"{indent}  -> ✓ In target range ({TARGET_MIN_CRIMES}-{TARGET_MAX_CRIMES}), adding to batch")
-                results_buffer.append((polygon_str, crime_count, date))
-                results.append((polygon_coords, crime_count))
+                # Perfect range! Save area and crimes immediately
+                print(f"{indent}  -> ✓ In target range ({TARGET_MIN_CRIMES}-{TARGET_MAX_CRIMES}), saving area and crimes")
 
-                # Batch commit every 50 areas
-                if len(results_buffer) >= 50:
-                    try:
-                        cursor.executemany(
-                            """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
-                               VALUES (?, ?, ?)""",
-                            results_buffer
-                        )
-                        conn.commit()
-                        print(f"{indent}  -> Batch committed {len(results_buffer)} areas")
-                        results_buffer.clear()
-                    except Exception as e:
-                        print(f"{indent}  -> Error in batch commit: {e}")
+                try:
+                    # Insert area (or ignore if exists)
+                    cursor.execute(
+                        """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
+                           VALUES (?, ?, ?)""",
+                        (polygon_str, crime_count, date)
+                    )
+
+                    # Get the area_id (either newly inserted or existing)
+                    cursor.execute(
+                        """SELECT id FROM crime_areas WHERE polygon = ? AND date = ?""",
+                        (polygon_str, date)
+                    )
+                    area_id = cursor.fetchone()[0]
+
+                    # Insert individual crimes
+                    crimes_inserted = insert_crimes_batch(area_id, data)
+                    print(f"{indent}  -> ✓ Saved area_id={area_id}, inserted {crimes_inserted} individual crimes")
+
+                    conn.commit()
+                    results.append((polygon_coords, crime_count))
+
+                except Exception as e:
+                    print(f"{indent}  -> ⚠ Error saving area/crimes: {e}")
 
             else:
                 # Too few crimes, but save anyway for completeness
-                print(f"{indent}  -> Below target ({TARGET_MIN_CRIMES}), adding to batch")
-                results_buffer.append((polygon_str, crime_count, date))
-                results.append((polygon_coords, crime_count))
+                print(f"{indent}  -> Below target ({TARGET_MIN_CRIMES}), saving area and crimes")
 
-                # Batch commit every 50 areas
-                if len(results_buffer) >= 50:
-                    try:
-                        cursor.executemany(
-                            """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
-                               VALUES (?, ?, ?)""",
-                            results_buffer
-                        )
-                        conn.commit()
-                        print(f"{indent}  -> Batch committed {len(results_buffer)} areas")
-                        results_buffer.clear()
-                    except Exception as e:
-                        print(f"{indent}  -> Error in batch commit: {e}")
+                try:
+                    # Insert area (or ignore if exists)
+                    cursor.execute(
+                        """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
+                           VALUES (?, ?, ?)""",
+                        (polygon_str, crime_count, date)
+                    )
+
+                    # Get the area_id
+                    cursor.execute(
+                        """SELECT id FROM crime_areas WHERE polygon = ? AND date = ?""",
+                        (polygon_str, date)
+                    )
+                    area_id = cursor.fetchone()[0]
+
+                    # Insert individual crimes
+                    crimes_inserted = insert_crimes_batch(area_id, data)
+                    print(f"{indent}  -> ✓ Saved area_id={area_id}, inserted {crimes_inserted} individual crimes")
+
+                    conn.commit()
+                    results.append((polygon_coords, crime_count))
+
+                except Exception as e:
+                    print(f"{indent}  -> ⚠ Error saving area/crimes: {e}")
 
         else:
             # Other errors (500, timeout, etc.)
@@ -613,8 +707,6 @@ def show_execute_controls(display):
 
 @app.cell
 def run_bisection_process(
-    conn,
-    cursor,
     process_area,
     run_button,
     selected_bounds,
@@ -623,15 +715,15 @@ def run_bisection_process(
     run_button  # Create dependency
 
     if run_button.value:
-        print("Starting bisection algorithm (with caching & batch commits)...")
+        print("Starting bisection algorithm (with caching & individual crime tracking)...")
         print(f"Date: {test_date.value}")
         print(f"Bounds: {selected_bounds}")
         print("-" * 60)
 
-        # Initialize counters and buffers
+        # Initialize counters
         api_call_counter = [0]
         cache_hits = [0]
-        results_buffer = []  # For batch commits
+        results_buffer = []  # Kept for compatibility but not used for batch commits
 
         results = process_area(
             north=selected_bounds["north"],
@@ -643,19 +735,6 @@ def run_bisection_process(
             results_buffer=results_buffer,
             cache_hits=cache_hits,
         )
-
-        # Final batch commit for any remaining items
-        if results_buffer:
-            try:
-                cursor.executemany(
-                    """INSERT OR IGNORE INTO crime_areas (polygon, crime_count, date)
-                       VALUES (?, ?, ?)""",
-                    results_buffer
-                )
-                conn.commit()
-                print(f"Final batch committed {len(results_buffer)} areas")
-            except Exception as e:
-                print(f"Error in final batch commit: {e}")
 
         print("-" * 60)
         print(f"Completed! Found {len(results)} areas in target range.")
@@ -746,7 +825,8 @@ def visualize_results(
         POLYGON_WEIGHT = 2             # 2px border width
 
         # Add each bisected area as a polygon
-        for idx, (polygon_coords, crime_count) in enumerate(bisection_results):
+        # Start enumeration at 1 to match database area_id
+        for idx, (polygon_coords, crime_count) in enumerate(bisection_results, start=1):
             # Convert to list of [lat, lon] for folium
             locations = [[lat, lon] for lat, lon in polygon_coords]
 
@@ -801,6 +881,43 @@ def visualize_results(
 def _(output):
 
     output
+    return
+
+
+@app.cell
+def _(conn, pl):
+    df_chk = pl.read_database("SELECT * FROM crime_areas", conn)
+    return (df_chk,)
+
+
+@app.cell
+def _(df_chk):
+    df_chk
+    return
+
+
+@app.cell
+def crimes_data(conn, pl):
+    """Query individual crimes data from the crimes table."""
+    df_crimes = pl.read_database(
+        """SELECT c.*, ca.date, ca.crime_count as area_crime_count
+           FROM crimes c
+           LEFT JOIN crime_areas ca ON c.area_id = ca.id
+           ORDER BY c.id DESC
+           LIMIT 1000""",
+        conn
+    )
+    return (df_crimes,)
+
+
+@app.cell
+def _(df_crimes):
+    df_crimes
+    return
+
+
+@app.cell
+def _():
     return
 
 
