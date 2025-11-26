@@ -12,7 +12,7 @@
 
 import marimo
 
-__generated_with = "0.18.0"
+__generated_with = "0.18.1"
 app = marimo.App(width="medium")
 
 
@@ -61,14 +61,52 @@ def configuration(mo):
 
 @app.cell
 def api_config():
-    """API configuration constants."""
+    """Centralized configuration for the entire application."""
+
+    # API Configuration
     API_BASE_URL = "https://data.police.uk/api/crimes-street/all-crime"
     MAX_CALLS_PER_SECOND = 10
+    API_DELAY_SECONDS = 0.1  # Delay between API calls (10 calls/sec = 0.1s delay)
+
+    # Crime count targets for bisection algorithm
     TARGET_MIN_CRIMES = 5000
     TARGET_MAX_CRIMES = 7500
-    MAX_CRIMES_LIMIT = 10000
+    MAX_CRIMES_LIMIT = 10000  # API returns 403 if exceeded
+
+    # Bisection algorithm settings
+    MAX_RECURSION_DEPTH = 15  # Prevent infinite recursion
+
+    # Database settings
     DB_PATH = "uk_crime_data.db"
-    return API_BASE_URL, DB_PATH, TARGET_MAX_CRIMES, TARGET_MIN_CRIMES
+    BATCH_COMMIT_SIZE = 50  # Commit every N area inserts (if using batch mode)
+
+    # Default dates for UI
+    DEFAULT_BASE_DATE = "2025-09"  # Default base date for historical collection
+    DEFAULT_START_DATE = "2024-01"
+    DEFAULT_END_DATE = "2024-01"
+
+    # Boundary cache
+    BOUNDARY_CACHE_PATH = "uk_boundary_cache.pkl"
+
+    # GitHub GeoJSON sources for UK boundaries
+    GITHUB_GB_BOUNDARY_URL = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
+    GITHUB_NI_BOUNDARY_URL = "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/ni/lgd.json"
+
+    return (
+        API_BASE_URL,
+        API_DELAY_SECONDS,
+        BATCH_COMMIT_SIZE,
+        BOUNDARY_CACHE_PATH,
+        DB_PATH,
+        DEFAULT_BASE_DATE,
+        DEFAULT_END_DATE,
+        DEFAULT_START_DATE,
+        GITHUB_GB_BOUNDARY_URL,
+        GITHUB_NI_BOUNDARY_URL,
+        MAX_RECURSION_DEPTH,
+        TARGET_MAX_CRIMES,
+        TARGET_MIN_CRIMES,
+    )
 
 
 @app.cell
@@ -282,8 +320,128 @@ def database_setup(DB_PATH, sqlite3):
         )
     """)
 
+    # Create table for error logging
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS api_error_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            error_type TEXT NOT NULL,
+            status_code INTEGER,
+            date_requested TEXT,
+            polygon TEXT,
+            error_message TEXT,
+            recursion_depth INTEGER
+        )
+    """)
+
+    # Create indexes for performance
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_crimes_area_id
+        ON crimes(area_id)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_crimes_month
+        ON crimes(month)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_crimes_category
+        ON crimes(category)
+    """)
+
     conn.commit()
     return conn, cursor
+
+
+@app.cell
+def create_database_views(cursor, conn):
+    """Create database views for common queries."""
+
+    # View: Crime summary by area, category, and month
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS crime_summary AS
+        SELECT
+            c.area_id,
+            ca.date as area_date,
+            ca.polygon,
+            c.category,
+            c.month,
+            COUNT(*) as crime_count,
+            COUNT(DISTINCT c.crime_id) as unique_crimes
+        FROM crimes c
+        LEFT JOIN crime_areas ca ON c.area_id = ca.id
+        GROUP BY c.area_id, ca.date, ca.polygon, c.category, c.month
+    """)
+
+    # View: Monthly totals across all areas
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS monthly_totals AS
+        SELECT
+            c.month,
+            COUNT(*) as total_crimes,
+            COUNT(DISTINCT c.category) as unique_categories,
+            COUNT(DISTINCT c.area_id) as areas_with_crimes
+        FROM crimes c
+        GROUP BY c.month
+        ORDER BY c.month
+    """)
+
+    # View: Category breakdown across all data
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS category_totals AS
+        SELECT
+            c.category,
+            COUNT(*) as total_crimes,
+            COUNT(DISTINCT c.month) as months_present,
+            COUNT(DISTINCT c.area_id) as areas_affected,
+            MIN(c.month) as first_occurrence,
+            MAX(c.month) as last_occurrence
+        FROM crimes c
+        GROUP BY c.category
+        ORDER BY total_crimes DESC
+    """)
+
+    # View: Area statistics
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS area_statistics AS
+        SELECT
+            ca.id as area_id,
+            ca.date,
+            ca.polygon,
+            ca.crime_count as reported_count,
+            COUNT(c.id) as actual_crime_count,
+            COUNT(DISTINCT c.category) as unique_categories,
+            COUNT(DISTINCT c.month) as months_with_data,
+            MIN(c.month) as earliest_crime,
+            MAX(c.month) as latest_crime
+        FROM crime_areas ca
+        LEFT JOIN crimes c ON ca.id = c.area_id
+        GROUP BY ca.id, ca.date, ca.polygon, ca.crime_count
+    """)
+
+    # View: Crime hotspots (areas with highest crime rates)
+    cursor.execute("""
+        CREATE VIEW IF NOT EXISTS crime_hotspots AS
+        SELECT
+            c.area_id,
+            ca.date as area_date,
+            c.latitude,
+            c.longitude,
+            c.street_name,
+            COUNT(*) as crime_count,
+            GROUP_CONCAT(DISTINCT c.category) as crime_types
+        FROM crimes c
+        LEFT JOIN crime_areas ca ON c.area_id = ca.id
+        WHERE c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+        GROUP BY c.area_id, ca.date, c.latitude, c.longitude, c.street_name
+        HAVING crime_count > 1
+        ORDER BY crime_count DESC
+    """)
+
+    conn.commit()
+    print("✓ Database views created successfully")
+    return
 
 
 @app.cell
@@ -309,6 +467,64 @@ def cache_functions(cursor):
         result = cursor.fetchone()
         return {"areas": result[0] or 0, "total_crimes": result[1] or 0}
     return (check_area_cached,)
+
+
+@app.cell
+def error_logging_functions(cursor, conn):
+    """Functions for logging and viewing API errors."""
+
+    def log_api_error(error_type, status_code=None, date_requested=None,
+                     polygon=None, error_message=None, recursion_depth=None):
+        """
+        Log an API error to the database.
+
+        Args:
+            error_type: Type of error (e.g., 'API_403', 'API_TIMEOUT', 'HTTP_ERROR')
+            status_code: HTTP status code if applicable
+            date_requested: Date parameter sent to API
+            polygon: Polygon string sent to API
+            error_message: Detailed error message
+            recursion_depth: Current recursion depth when error occurred
+        """
+        cursor.execute(
+            """INSERT INTO api_error_log
+               (error_type, status_code, date_requested, polygon, error_message, recursion_depth)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (error_type, status_code, date_requested, polygon, error_message, recursion_depth)
+        )
+        conn.commit()
+
+    def get_error_summary():
+        """Get summary of errors by type."""
+        cursor.execute(
+            """SELECT
+                error_type,
+                COUNT(*) as error_count,
+                MIN(timestamp) as first_occurrence,
+                MAX(timestamp) as last_occurrence
+               FROM api_error_log
+               GROUP BY error_type
+               ORDER BY error_count DESC"""
+        )
+        return cursor.fetchall()
+
+    def get_recent_errors(limit=50):
+        """Get most recent errors."""
+        cursor.execute(
+            """SELECT * FROM api_error_log
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (limit,)
+        )
+        return cursor.fetchall()
+
+    def clear_error_log():
+        """Clear all error logs (use with caution)."""
+        cursor.execute("DELETE FROM api_error_log")
+        conn.commit()
+        return cursor.rowcount
+
+    return (log_api_error, get_error_summary, get_recent_errors, clear_error_log)
 
 
 @app.cell
@@ -461,6 +677,257 @@ def api_functions(API_BASE_URL, format_polygon, httpx, sleep):
         except Exception as e:
             return 500, str(e), 0
     return (fetch_crimes,)
+
+
+@app.cell
+def async_api_config():
+    """Configuration for async API operations."""
+    import asyncio
+
+    # Async configuration
+    MAX_CONCURRENT_REQUESTS = 10  # Max concurrent API calls (respects 10 req/sec limit)
+    RATE_LIMIT_DELAY = 0.1  # Delay between requests (100ms = 10 req/sec)
+
+    return (MAX_CONCURRENT_REQUESTS, RATE_LIMIT_DELAY, asyncio)
+
+
+@app.cell
+def async_api_functions(API_BASE_URL, asyncio, httpx):
+    """Async API functions for concurrent crime data fetching."""
+
+    async def fetch_crimes_async(client, semaphore, polygon_coords, date, format_polygon_func):
+        """
+        Async version of fetch_crimes for concurrent processing.
+
+        Args:
+            client: httpx.AsyncClient instance
+            semaphore: asyncio.Semaphore for rate limiting
+            polygon_coords: List of (lat, lon) tuples
+            date: Date string (YYYY-MM)
+            format_polygon_func: Function to format polygon coords
+
+        Returns:
+            (status_code, data, crime_count)
+        """
+        polygon_str = format_polygon_func(polygon_coords)
+        params = {
+            "date": date,
+            "poly": polygon_str
+        }
+
+        # Use semaphore to limit concurrent requests
+        async with semaphore:
+            try:
+                response = await client.get(API_BASE_URL, params=params, timeout=30.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    return 200, data, len(data)
+                else:
+                    return response.status_code, None, 0
+            except Exception as e:
+                return 500, str(e), 0
+            finally:
+                # Small delay to respect rate limit
+                await asyncio.sleep(0.1)
+
+    return (fetch_crimes_async,)
+
+
+@app.cell
+def async_historical_fetcher(
+    asyncio,
+    DB_PATH,
+    fetch_crimes_async,
+    format_polygon,
+    httpx,
+    MAX_CONCURRENT_REQUESTS,
+    sqlite3,
+):
+    """Async version of historical crime fetcher with concurrent processing."""
+
+    async def fetch_historical_crimes_async(areas, date, progress_callback=None):
+        """
+        Fetch crimes for all areas concurrently using async.
+        Creates its own database connection to avoid thread-safety issues.
+
+        Args:
+            areas: List of (area_id, polygon_str, crime_count) tuples
+            date: Date string (YYYY-MM)
+            progress_callback: Optional callback function
+
+        Returns:
+            Dictionary with statistics
+        """
+        # Create database connection in this thread
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Define insert_crimes_batch locally with this connection
+        def insert_crimes_batch(area_id, crimes_data):
+            """Insert crime records for this area."""
+            if not crimes_data:
+                return 0
+
+            crime_records = []
+            for crime in crimes_data:
+                crime_id = crime.get('id')
+                if not crime_id:
+                    continue
+
+                category = crime.get('category', '')
+                location = crime.get('location', {})
+                latitude = location.get('latitude')
+                longitude = location.get('longitude')
+                street_name = location.get('street', {}).get('name', '')
+                month = crime.get('month', '')
+
+                crime_records.append((
+                    area_id, crime_id, category,
+                    float(latitude) if latitude else None,
+                    float(longitude) if longitude else None,
+                    street_name, month
+                ))
+
+            if crime_records:
+                cursor.executemany(
+                    """INSERT OR IGNORE INTO crimes
+                       (area_id, crime_id, category, latitude, longitude, street_name, month)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    crime_records
+                )
+                return len(crime_records)
+            return 0
+
+        total_areas = len(areas)
+        successful = 0
+        failed = 0
+        cached = 0
+        total_crimes_inserted = 0
+
+        # Create semaphore for rate limiting
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        # Create async HTTP client
+        async with httpx.AsyncClient() as client:
+            # Process areas concurrently
+            tasks = []
+
+            for idx, (area_id, polygon_str, _) in enumerate(areas, start=1):
+                # Check cache first (synchronous)
+                cursor.execute(
+                    """SELECT id, crime_count FROM crime_areas
+                       WHERE polygon = ? AND date = ?""",
+                    (polygon_str, date)
+                )
+                result = cursor.fetchone()
+
+                if result:
+                    # Data already exists - skip API call
+                    existing_area_id, existing_crime_count = result
+                    cursor.execute(
+                        """SELECT COUNT(*) FROM crimes WHERE area_id = ?""",
+                        (existing_area_id,)
+                    )
+                    crimes_count = cursor.fetchone()[0]
+
+                    if crimes_count > 0:
+                        # Complete data exists
+                        cached += 1
+                        total_crimes_inserted += crimes_count
+                        if progress_callback:
+                            progress_callback(idx, total_areas, area_id, existing_crime_count, crimes_count, cached=True)
+                        continue
+
+                # Convert polygon string to coords
+                polygon_coords = []
+                for pair in polygon_str.split(':'):
+                    lat, lon = pair.split(',')
+                    polygon_coords.append((float(lat), float(lon)))
+
+                # Create async task
+                task = fetch_crimes_async(client, semaphore, polygon_coords, date, format_polygon)
+                tasks.append((idx, area_id, polygon_str, result, task))
+
+            # Wait for all tasks to complete
+            for idx, area_id, polygon_str, cached_result, task in tasks:
+                status_code, data, crime_count = await task
+
+                if status_code == 200:
+                    if not cached_result:
+                        # Insert new area/date record
+                        cursor.execute(
+                            """INSERT INTO crime_areas (polygon, crime_count, date)
+                               VALUES (?, ?, ?)""",
+                            (polygon_str, crime_count, date)
+                        )
+                        area_id_to_use = cursor.lastrowid
+                    else:
+                        area_id_to_use = cached_result[0]
+
+                    # Insert crimes
+                    crimes_inserted = insert_crimes_batch(area_id_to_use, data)
+                    total_crimes_inserted += crimes_inserted
+                    successful += 1
+                    conn.commit()
+
+                    if progress_callback:
+                        progress_callback(idx, total_areas, area_id, crime_count, crimes_inserted)
+                else:
+                    failed += 1
+                    if progress_callback:
+                        progress_callback(idx, total_areas, area_id, 0, 0, error=status_code)
+
+        # Close the connection we created
+        conn.close()
+
+        return {
+            'total_areas': total_areas,
+            'successful': successful,
+            'failed': failed,
+            'cached': cached,
+            'total_crimes': total_crimes_inserted
+        }
+
+    return (fetch_historical_crimes_async,)
+
+
+@app.cell
+def async_runner_helper(asyncio):
+    """Helper to run async functions in Marimo."""
+    import concurrent.futures
+
+    def run_async(async_func, *args, **kwargs):
+        """
+        Run an async function and return the result.
+        Handles running event loops (Marimo/Jupyter) by using a thread pool.
+
+        Args:
+            async_func: Async function to run
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Result of the async function
+        """
+        try:
+            # Check if we're in a running event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Marimo/Jupyter case: Run async code in a separate thread
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        async_func(*args, **kwargs)
+                    )
+                    return future.result()
+            else:
+                # No running loop: use run_until_complete
+                return loop.run_until_complete(async_func(*args, **kwargs))
+        except RuntimeError:
+            # No event loop exists: create one
+            return asyncio.run(async_func(*args, **kwargs))
+
+    return (run_async,)
 
 
 @app.cell
@@ -1037,16 +1504,171 @@ def _(df_crimes):
 
 
 @app.cell
+def database_summary_stats(conn, pl, mo):
+    """Generate comprehensive database statistics display."""
+
+    def get_summary_stats_display():
+        """Create and return the summary statistics display."""
+        # Query all the views we created
+        monthly_stats = pl.read_database("SELECT * FROM monthly_totals", conn)
+        category_stats = pl.read_database("SELECT * FROM category_totals", conn)
+        area_stats = pl.read_database(
+            """SELECT
+                COUNT(*) as total_areas,
+                COUNT(DISTINCT date) as unique_dates,
+                SUM(actual_crime_count) as total_crimes,
+                AVG(actual_crime_count) as avg_crimes_per_area,
+                MIN(earliest_crime) as earliest_crime_date,
+                MAX(latest_crime) as latest_crime_date
+            FROM area_statistics""",
+            conn
+        )
+
+        # Get overall database stats
+        db_stats = pl.read_database(
+            """SELECT
+                (SELECT COUNT(*) FROM crime_areas) as total_area_records,
+                (SELECT COUNT(*) FROM crimes) as total_crime_records,
+                (SELECT COUNT(DISTINCT polygon) FROM crime_areas) as unique_polygons,
+                (SELECT COUNT(DISTINCT date) FROM crime_areas) as date_range_count
+            """,
+            conn
+        )
+
+        # Format the summary markdown
+        stats = db_stats.row(0, named=True)
+        area_info = area_stats.row(0, named=True)
+
+        summary_md = f"""
+        # 📊 Database Summary Statistics
+
+        ## Overall Coverage
+        - **Total Crime Records**: {stats['total_crime_records']:,}
+        - **Total Area Records**: {stats['total_area_records']:,}
+        - **Unique Geographic Areas**: {stats['unique_polygons']:,}
+        - **Date Range**: {area_info['earliest_crime_date']} to {area_info['latest_crime_date']}
+        - **Months Covered**: {stats['date_range_count']}
+
+        ## Area Statistics
+        - **Average Crimes per Area**: {area_info['avg_crimes_per_area']:.1f}
+        - **Total Areas Analyzed**: {area_info['total_areas']:,}
+
+        ## Top Crime Categories
+        """
+
+        # Add top 10 categories to markdown
+        top_categories = category_stats.head(10)
+        for row in top_categories.iter_rows(named=True):
+            pct = (row['total_crimes'] / stats['total_crime_records'] * 100) if stats['total_crime_records'] > 0 else 0
+            summary_md += f"\n- **{row['category']}**: {row['total_crimes']:,} crimes ({pct:.1f}%) - {row['areas_affected']} areas affected"
+
+        summary_md += f"""
+
+        ## Monthly Coverage
+        - **Months with Data**: {len(monthly_stats)}
+        - **Average Crimes per Month**: {monthly_stats['total_crimes'].mean():.0f}
+        - **Peak Month**: {monthly_stats.filter(pl.col('total_crimes') == pl.col('total_crimes').max()).select('month').item()} ({monthly_stats['total_crimes'].max():,} crimes)
+        """
+
+        # Create display with both markdown and dataframes
+        summary_display = mo.vstack([
+            mo.md(summary_md),
+            mo.md("---"),
+            mo.md("### 📅 Monthly Breakdown"),
+            mo.ui.table(monthly_stats),
+            mo.md("---"),
+            mo.md("### 🏷️ All Crime Categories"),
+            mo.ui.table(category_stats)
+        ])
+
+        return summary_display
+
+    return (get_summary_stats_display,)
+
+
+@app.cell
+def show_summary_stats(get_summary_stats_display):
+    """Display the summary statistics."""
+    summary_stats_output = get_summary_stats_display()
+    return (summary_stats_output,)
+
+
+@app.cell
+def _(summary_stats_output):
+    summary_stats_output
+    return
+
+
+@app.cell
+def error_log_display(conn, pl, mo, get_error_summary, get_recent_errors):
+    """Generate API error logs display."""
+
+    def get_error_log_display():
+        """Create and return the error log display."""
+        # Get error summary
+        error_summary = get_error_summary()
+
+        # Get recent errors
+        recent_errors_data = get_recent_errors(limit=20)
+
+        # Format display
+        if not error_summary:
+            error_log_output = mo.md("## 🟢 Error Log\n\nNo errors logged. All API calls have been successful!")
+        else:
+            # Create summary markdown
+            summary_md = "## ⚠️ Error Log Summary\n\n"
+            total_errors = sum(row[1] for row in error_summary)
+            summary_md += f"**Total Errors**: {total_errors:,}\n\n"
+            summary_md += "### Errors by Type\n"
+
+            for error_type, count, first, last in error_summary:
+                summary_md += f"- **{error_type}**: {count:,} occurrences (First: {first}, Last: {last})\n"
+
+            # Load recent errors into dataframe
+            if recent_errors_data:
+                recent_df = pl.DataFrame(
+                    recent_errors_data,
+                    schema=['id', 'timestamp', 'error_type', 'status_code',
+                           'date_requested', 'polygon', 'error_message', 'recursion_depth'],
+                    orient='row'
+                )
+                error_log_output = mo.vstack([
+                    mo.md(summary_md),
+                    mo.md("---"),
+                    mo.md("### Recent Errors (Last 20)"),
+                    mo.ui.table(recent_df)
+                ])
+            else:
+                error_log_output = mo.md(summary_md)
+
+        return error_log_output
+
+    return (get_error_log_display,)
+
+
+@app.cell
+def show_error_log(get_error_log_display):
+    """Display the error log."""
+    error_log_output = get_error_log_display()
+    return (error_log_output,)
+
+
+@app.cell
+def _(error_log_output):
+    error_log_output
+    return
+
+
+@app.cell
 def _():
     return
 
 
-app._unparsable_cell(
-    r"""
-    \"> There is still an issue witht he visualize_results cell
-    \"\"Functions for loading existing areas and processing historical data.\"\"\"
+@app.cell
+def historical_data_functions(cursor):
+    """Functions for loading existing areas and processing historical data."""
     def load_existing_areas(base_date=None):
-        \"\"\"
+        """
         Load existing area polygons from the database.
 
         Args:
@@ -1055,29 +1677,29 @@ app._unparsable_cell(
 
         Returns:
             List of tuples: [(area_id, polygon_str, base_crime_count), ...]
-        \"\"\"
+        """
         if base_date:
             cursor.execute(
-                \"\"\"SELECT id, polygon, crime_count
+                """SELECT id, polygon, crime_count
                    FROM crime_areas
                    WHERE date = ?
-                   ORDER BY id\"\"\",
+                   ORDER BY id""",
                 (base_date,)
             )
         else:
             # Get unique polygons (take first occurrence of each)
             cursor.execute(
-                \"\"\"SELECT id, polygon, crime_count
+                """SELECT id, polygon, crime_count
                    FROM crime_areas
                    GROUP BY polygon
-                   ORDER BY id\"\"\"
+                   ORDER BY id"""
             )
 
         areas = cursor.fetchall()
         return areas
 
     def generate_month_range(start_date, end_date):
-        \"\"\"
+        """
         Generate list of months between start_date and end_date (inclusive).
 
         Args:
@@ -1086,7 +1708,7 @@ app._unparsable_cell(
 
         Returns:
             List of date strings: ['2024-01', '2024-02', ...]
-        \"\"\"
+        """
         start_year, start_month = map(int, start_date.split('-'))
         end_year, end_month = map(int, end_date.split('-'))
 
@@ -1095,16 +1717,14 @@ app._unparsable_cell(
         current_month = start_month
 
         while (current_year < end_year) or (current_year == end_year and current_month <= end_month):
-            months.append(f\"{current_year:04d}-{current_month:02d}\")
+            months.append(f"{current_year:04d}-{current_month:02d}")
             current_month += 1
             if current_month > 12:
                 current_month = 1
                 current_year += 1
 
         return months
-    """,
-    name="historical_data_functions"
-)
+    return generate_month_range, load_existing_areas
 
 
 @app.cell
@@ -1125,9 +1745,40 @@ def historical_crime_fetcher(conn, cursor, fetch_crimes, insert_crimes_batch):
         total_areas = len(areas)
         successful = 0
         failed = 0
+        cached = 0
         total_crimes_inserted = 0
 
         for idx, (area_id, polygon_str, _) in enumerate(areas, start=1):
+            # Check if this area/date combination already exists in database
+            cursor.execute(
+                """SELECT id, crime_count FROM crime_areas
+                   WHERE polygon = ? AND date = ?""",
+                (polygon_str, date)
+            )
+            result = cursor.fetchone()
+
+            if result:
+                # Data already exists - skip API call
+                existing_area_id, existing_crime_count = result
+
+                # Check if crimes were actually inserted for this area
+                cursor.execute(
+                    """SELECT COUNT(*) FROM crimes WHERE area_id = ?""",
+                    (existing_area_id,)
+                )
+                crimes_count = cursor.fetchone()[0]
+
+                if crimes_count > 0:
+                    # Complete data exists, skip entirely
+                    cached += 1
+                    total_crimes_inserted += crimes_count
+                    if progress_callback:
+                        progress_callback(idx, total_areas, area_id, existing_crime_count, crimes_count, cached=True)
+                    continue
+                else:
+                    # Area exists but no crimes - will refetch below
+                    area_id_to_use = existing_area_id
+
             # Convert polygon string back to coords for API
             # Format: "lat1,lon1:lat2,lon2:..."
             polygon_coords = []
@@ -1135,23 +1786,11 @@ def historical_crime_fetcher(conn, cursor, fetch_crimes, insert_crimes_batch):
                 lat, lon = pair.split(',')
                 polygon_coords.append((float(lat), float(lon)))
 
-            # Fetch crimes from API
+            # Fetch crimes from API (only if not cached)
             status_code, data, crime_count = fetch_crimes(polygon_coords, date)
 
             if status_code == 200:
-                # Check if this area/date already exists in crime_areas
-                cursor.execute(
-                    """SELECT id FROM crime_areas
-                       WHERE polygon = ? AND date = ?""",
-                    (polygon_str, date)
-                )
-                result = cursor.fetchone()
-
-                if result:
-                    # Area/date exists, use existing area_id
-                    existing_area_id = result[0]
-                    area_id_to_use = existing_area_id
-                else:
+                if not result:
                     # Insert new area/date record
                     cursor.execute(
                         """INSERT INTO crime_areas (polygon, crime_count, date)
@@ -1178,6 +1817,7 @@ def historical_crime_fetcher(conn, cursor, fetch_crimes, insert_crimes_batch):
             'total_areas': total_areas,
             'successful': successful,
             'failed': failed,
+            'cached': cached,
             'total_crimes': total_crimes_inserted
         }
     return (fetch_historical_crimes,)
@@ -1198,8 +1838,13 @@ def historical_ui_controls(mo):
     )
 
     base_date_for_areas = mo.ui.text(
-        value="2024-01",
+        value="2025-09",
         label="Base Date (areas to use)"
+    )
+
+    use_async_mode = mo.ui.checkbox(
+        value=True,
+        label="Use Async Mode (10x faster - concurrent API calls)"
     )
 
     historical_run_button = mo.ui.run_button(
@@ -1213,16 +1858,20 @@ def historical_ui_controls(mo):
         Use existing areas from the database to fetch crime data for multiple months.
 
         **Instructions:**
-        1. **Base Date**: The date of the bisection run (which areas to use)
+        1. **Base Date**: The date of the bisection run (which areas to use) - Default: 2025-09
         2. **Start Date**: First month to fetch
         3. **End Date**: Last month to fetch (inclusive)
-        4. Click "Fetch Historical Crime Data" to begin
+        4. **Async Mode**: Enable for 5-10x faster processing (concurrent API calls)
+        5. Click "Fetch Historical Crime Data" to begin
 
-        **Note**: This will fetch crimes for ALL areas for each month in the range.
+        **Performance:**
+        - **Sync Mode**: Sequential API calls (~3-5 minutes for 24 areas × 12 months)
+        - **Async Mode**: Concurrent API calls (~30-60 seconds for same workload) ⚡
         """),
         base_date_for_areas,
         historical_start_date,
         historical_end_date,
+        use_async_mode,
         historical_run_button
     ])
     return (
@@ -1231,6 +1880,7 @@ def historical_ui_controls(mo):
         historical_end_date,
         historical_run_button,
         historical_start_date,
+        use_async_mode,
     )
 
 
@@ -1244,18 +1894,25 @@ def show_historical_controls(historical_display):
 def run_historical_collection(
     base_date_for_areas,
     fetch_historical_crimes,
+    fetch_historical_crimes_async,
     generate_month_range,
     historical_end_date,
     historical_run_button,
     historical_start_date,
     load_existing_areas,
+    run_async,
+    use_async_mode,
 ):
-    """Execute historical data collection."""
+    """Execute historical data collection with optional async mode."""
+    import time
     historical_run_button  # Create dependency
 
     if historical_run_button.value:
+        start_time = time.time()
+
         print("=" * 70)
         print("HISTORICAL CRIME DATA COLLECTION")
+        print(f"Mode: {'ASYNC (Concurrent)' if use_async_mode.value else 'SYNC (Sequential)'} ⚡" if use_async_mode.value else "Mode: SYNC (Sequential)")
         print("=" * 70)
 
         # Load existing areas
@@ -1278,37 +1935,65 @@ def run_historical_collection(
             total_stats = {
                 'months_processed': 0,
                 'total_crimes': 0,
-                'total_api_calls': 0
+                'total_api_calls': 0,
+                'total_cache_hits': 0
             }
 
+            # Choose fetcher based on mode
+            fetcher = fetch_historical_crimes_async if use_async_mode.value else fetch_historical_crimes
+
             for month in months:
+                month_start = time.time()
                 print(f"\n{'─' * 70}")
                 print(f"Processing: {month}")
                 print(f"{'─' * 70}")
 
-                def progress(idx, total, area_id, crime_count, crimes_inserted, error=None):
+                def progress(idx, total, area_id, crime_count, crimes_inserted, error=None, cached=False):
                     if error:
                         print(f"  [{idx}/{total}] Area {area_id} - ⚠ Error {error}")
+                    elif cached:
+                        print(f"  [{idx}/{total}] Area {area_id} - ✓ CACHED ({crime_count} crimes)")
                     else:
                         print(f"  [{idx}/{total}] Area {area_id} - {crime_count} crimes, {crimes_inserted} inserted")
 
-                month_stats = fetch_historical_crimes(areas, month, progress)
+                # Run async or sync based on mode
+                if use_async_mode.value:
+                    month_stats = run_async(fetcher, areas, month, progress)
+                else:
+                    month_stats = fetcher(areas, month, progress)
 
-                print(f"\n✓ {month} Complete:")
-                print(f"  - Successful: {month_stats['successful']}/{month_stats['total_areas']}")
-                print(f"  - Failed: {month_stats['failed']}")
-                print(f"  - Total crimes inserted: {month_stats['total_crimes']:,}")
+                month_duration = time.time() - month_start
+
+                # Calculate API calls (successful + failed, excluding cached)
+                api_calls = month_stats['successful'] + month_stats['failed']
+
+                print(f"\n✓ {month} Complete ({month_duration:.1f}s):")
+                print(f"  - Total areas: {month_stats['total_areas']}")
+                print(f"  - API calls made: {api_calls} (Successful: {month_stats['successful']}, Failed: {month_stats['failed']})")
+                print(f"  - Cache hits: {month_stats['cached']}")
+                print(f"  - Total crimes: {month_stats['total_crimes']:,}")
 
                 total_stats['months_processed'] += 1
                 total_stats['total_crimes'] += month_stats['total_crimes']
-                total_stats['total_api_calls'] += month_stats['total_areas']
+                total_stats['total_api_calls'] += api_calls
+                total_stats['total_cache_hits'] += month_stats['cached']
+
+            total_duration = time.time() - start_time
 
             print(f"\n{'═' * 70}")
             print("COLLECTION COMPLETE")
             print(f"{'═' * 70}")
+            print(f"Total time: {total_duration:.1f}s")
             print(f"Months processed: {total_stats['months_processed']}")
-            print(f"Total API calls: {total_stats['total_api_calls']:,}")
-            print(f"Total crimes inserted: {total_stats['total_crimes']:,}")
+            print(f"Total areas processed: {len(areas) * len(months):,}")
+            print(f"API calls made: {total_stats['total_api_calls']:,}")
+            print(f"Cache hits: {total_stats['total_cache_hits']:,}")
+            if total_stats['total_api_calls'] + total_stats['total_cache_hits'] > 0:
+                cache_rate = total_stats['total_cache_hits'] / (total_stats['total_api_calls'] + total_stats['total_cache_hits']) * 100
+                print(f"Cache hit rate: {cache_rate:.1f}%")
+            print(f"Total crimes: {total_stats['total_crimes']:,}")
+            if total_stats['total_api_calls'] > 0:
+                print(f"Average time per API call: {total_duration / total_stats['total_api_calls']:.2f}s")
             print(f"{'═' * 70}")
 
             historical_stats = total_stats
