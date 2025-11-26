@@ -450,6 +450,113 @@ uk_boundaries → UK_BOUNDS, UK_FULL_BOUNDS, fetch_boundary, get_fallback_bounda
 - All downstream code works unchanged
 - Performance unchanged (same logic, better organized)
 
+### Visualization Code Refactoring (Completed)
+**Date**: 2025-11-25
+**Rationale**: Improve maintainability by breaking down monolithic visualization function into focused, single-purpose functions.
+
+**Problem**: The `visualize_results()` function had become unwieldy (~120 lines) handling multiple responsibilities: map creation, boundary rendering, area polygon rendering, statistics calculation, and output formatting. This violated the single responsibility principle and made the code harder to maintain.
+
+**Solution** (main.py:756-942):
+Refactored into 5 separate, focused cells:
+
+1. **`map_helper_functions()`** (main.py:757-775):
+   - `calculate_map_center(bisection_results)` - Calculates center lat/lon from results
+   - `create_base_map(center_lat, center_lon, zoom_start)` - Creates folium base map
+   - Pure utility functions with no side effects
+
+2. **`boundary_rendering_functions()`** (main.py:778-819):
+   - `add_uk_boundary_to_map(map_obj, uk_boundary_polygon)` - Adds UK boundary to map
+   - Handles both Polygon and MultiPolygon geometry types
+   - Separate function focused solely on boundary rendering
+   - Red outline, no fill, with popup/tooltip
+
+3. **`area_rendering_functions()`** (main.py:822-865):
+   - `add_area_polygons_to_map(map_obj, bisection_results)` - Adds area polygons to map
+   - Defines styling constants (color, opacity, weight)
+   - Enumerates from 1 to match database area_id
+   - Creates interactive popups with area details
+
+4. **`statistics_functions()`** (main.py:868-902):
+   - `calculate_crime_statistics(bisection_results)` - Calculates stats dictionary
+   - `format_statistics_markdown(stats, total_api_calls, total_cache_hits)` - Formats markdown
+   - Separates calculation from presentation
+   - Reusable for different output formats
+
+5. **`visualize_results()`** (main.py:905-942):
+   - Main orchestrator function (now only ~20 lines)
+   - Clean workflow: create map → add boundary → add areas → calculate stats → combine output
+   - Delegates all logic to helper functions
+   - Easy to understand and modify
+
+**Benefits**:
+- ✓ **Single Responsibility**: Each function has one clear purpose
+- ✓ **Testability**: Individual functions can be tested in isolation
+- ✓ **Readability**: ~20-40 lines per function vs 120-line monolith
+- ✓ **Reusability**: Helper functions can be used independently
+- ✓ **Maintainability**: Changes to styling don't affect statistics logic
+- ✓ **Marimo Integration**: Clear dependency graph visualization
+- ✓ **Extensibility**: Easy to add new visualization types
+
+**Code Metrics**:
+- Before: 1 cell, 1 function, ~120 lines
+- After: 5 cells, 8 functions, avg 25 lines per function
+- Main orchestrator: Reduced from 120 lines to 20 lines
+- No breaking changes: Same output, better organized
+
+**No Breaking Changes**:
+- `visualize_results()` maintains same return signature
+- All downstream code works unchanged
+- Performance unchanged (same logic, better organized)
+
+### Bisection Execution Refactoring (Completed)
+**Date**: 2025-11-25
+**Rationale**: Improve reliability and maintainability by breaking down bisection execution into testable, focused functions.
+
+**Problem**: The `run_bisection_process()` function was causing issues due to mixed responsibilities: initialization, execution, output formatting, and result handling all in one cell. This made debugging difficult and state management unclear.
+
+**Solution** (main.py:708-811):
+Refactored into 3 separate, focused cells:
+
+1. **`bisection_execution_helpers()`** (main.py:709-737):
+   - `initialize_counters()` - Creates counter dictionaries with proper structure
+   - `print_bisection_header(date, bounds)` - Formats and prints execution header
+   - `print_bisection_summary(results, api_calls, cache_hits)` - Formats summary output
+   - Pure functions with no side effects beyond printing
+
+2. **`execute_bisection_algorithm()`** (main.py:740-764):
+   - Single responsibility: Execute bisection with given parameters
+   - Takes process_area function, bounds, date, and counters
+   - Returns results list
+   - Clear input/output contract
+   - Isolated execution logic for easier testing
+
+3. **`run_bisection_process()`** (main.py:767-811):
+   - Main orchestrator (now only ~30 lines vs previous ~45 lines)
+   - Clean workflow: initialize → print header → execute → print summary → return
+   - Delegates all logic to helper functions
+   - Clear state management with explicit returns
+
+**Benefits**:
+- ✓ **Separation of Concerns**: Initialization, execution, and output are separate
+- ✓ **Testability**: Each component can be tested in isolation
+- ✓ **Reliability**: Counter management isolated in single function
+- ✓ **Debuggability**: Clear boundaries between execution phases
+- ✓ **Maintainability**: Changes to output don't affect execution logic
+- ✓ **State Clarity**: Explicit counter dictionary structure
+- ✓ **Error Isolation**: Failures localized to specific functions
+
+**Code Metrics**:
+- Before: 1 cell, 1 function, ~45 lines with mixed responsibilities
+- After: 3 cells, 5 functions, avg 15-20 lines per function
+- Main orchestrator: Simplified workflow with clear delegation
+- No breaking changes: Same output and return values
+
+**No Breaking Changes**:
+- `run_bisection_process()` maintains same return signature
+- Returns same tuple: (bisection_results, total_api_calls, total_cache_hits)
+- All downstream code works unchanged
+- Performance unchanged (same logic, better organized)
+
 ### Project Documentation - README.md (Completed)
 **Date**: 2025-11-24
 **Rationale**: Create comprehensive project documentation for public sharing and onboarding.
@@ -574,8 +681,102 @@ CREATE TABLE crimes (
 **Next Steps** (Future Enhancements):
 - Add indexes on `crime_id`, `category`, `month` for faster queries
 - Create views for common aggregations (crimes by category, by street, etc.)
-- Implement historical data collection (multiple months)
+- ~~Implement historical data collection (multiple months)~~ ✓ Completed
 - Add crime outcome timeline tracking
+
+### Historical Data Collection with Date Ranges (Completed)
+**Date**: 2025-11-25
+**Rationale**: Enable efficient collection of crime data for multiple months using pre-defined bisection areas.
+
+**Problem**: After running the bisection algorithm to define optimal areas, users need to:
+- Fetch crime data for those same areas across multiple months
+- Avoid re-running the expensive bisection process for each month
+- Build historical datasets spanning multiple months or years
+
+**Solution** (main.py:924-1201):
+
+1. **Load Existing Areas Function** (main.py:927-956):
+   - `load_existing_areas(base_date)` - Loads area polygons from database
+   - Takes optional `base_date` parameter (e.g., "2024-01")
+   - Returns list of `(area_id, polygon_str, crime_count)` tuples
+   - Can load all unique polygons or filter by specific date
+
+2. **Date Range Generator** (main.py:958-983):
+   - `generate_month_range(start_date, end_date)` - Generates month list
+   - Pure Python implementation (no external dependencies)
+   - Inclusive range (includes both start and end months)
+   - Example: `generate_month_range("2023-01", "2023-03")` → `["2023-01", "2023-02", "2023-03"]`
+
+3. **Historical Crime Fetcher** (main.py:987-1065):
+   - `fetch_historical_crimes(areas, date, progress_callback)` - Fetches crimes for all areas
+   - Iterates through all areas from base date
+   - For each area:
+     - Parses polygon string back to coordinates
+     - Calls Police API with area polygon + target date
+     - Checks if area/date combination exists in `crime_areas`
+     - Inserts or reuses `area_id` appropriately
+     - Inserts individual crimes linked to correct `area_id`
+     - Commits transaction
+   - Returns statistics: total areas, successful, failed, total crimes
+   - Optional progress callback for real-time updates
+
+4. **UI Controls** (main.py:1068-1117):
+   - **Base Date**: Date of original bisection run (which areas to use)
+   - **Start Date**: First month to fetch (YYYY-MM)
+   - **End Date**: Last month to fetch (YYYY-MM, inclusive)
+   - **Run Button**: Triggers historical collection
+
+5. **Execution Logic** (main.py:1126-1201):
+   - Loads areas from base date
+   - Generates list of months in range
+   - For each month:
+     - Fetches crimes for all areas
+     - Shows progress (area-by-area)
+     - Displays statistics
+   - Summary statistics at end
+
+**Key Features**:
+- ✓ **Reuse Bisection Areas**: No need to re-bisect for each month
+- ✓ **Date Range Support**: Process multiple months in one run
+- ✓ **Progress Tracking**: Real-time updates for each area/month
+- ✓ **Duplicate Prevention**: Handles existing area/date combinations gracefully
+- ✓ **Statistics**: Detailed stats per month and overall totals
+- ✓ **Error Handling**: Tracks failed API calls, continues processing
+
+**Database Behavior**:
+- Each unique `(polygon, date)` combination creates new row in `crime_areas`
+- Same polygon across multiple months = multiple `area_id` values
+- Crimes always linked to correct `area_id` for their month
+- Enables temporal analysis: "How did crime change in Area X over time?"
+
+**Performance**:
+- Example: 24 areas × 12 months = 288 API calls (10 req/sec = ~29 seconds + API response time)
+- Rate limiting built-in (0.1s delay between calls)
+- No bisection overhead (already have optimal areas)
+- Batch processing of crimes for efficiency
+
+**Use Cases**:
+1. **Trend Analysis**: "How has crime changed in London from 2023 to 2024?"
+2. **Seasonal Patterns**: "Which months have highest crime rates?"
+3. **Historical Baselines**: "What's the typical crime count for this area?"
+4. **Comparative Analysis**: "How does this month compare to last year?"
+
+**Example Workflow**:
+```
+1. Run bisection for 2024-01 → Creates 24 optimal areas
+2. Historical collection:
+   - Base Date: 2024-01 (use these 24 areas)
+   - Start Date: 2023-01
+   - End Date: 2024-12
+   - Result: 24 areas × 24 months = 576 area/month combinations
+```
+
+**Benefits**:
+- ✓ **Efficient**: Reuses bisection results, no redundant processing
+- ✓ **Flexible**: Query any date range using any base areas
+- ✓ **Scalable**: Handles months, years, or decades of data
+- ✓ **Accurate**: Uses same precise boundaries for all months
+- ✓ **Traceable**: Each crime linked to specific area + month
 
 ##Problem to analyse
 Create a strategy for database creation of all Crimes reported in the UK by downloading crime data from a government provided ability

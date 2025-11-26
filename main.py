@@ -685,7 +685,7 @@ def execute_bisection(mo, test_area, test_date):
 
     run_button = mo.ui.run_button(label="Run Bisection Algorithm")
 
-    display = mo.vstack([
+    bisection_display = mo.vstack([
         mo.md(f"""
         ### Ready to Execute
 
@@ -696,56 +696,116 @@ def execute_bisection(mo, test_area, test_date):
         """),
         run_button
     ])
-    return display, run_button
+    return bisection_display, run_button
 
 
 @app.cell
-def show_execute_controls(display):
-    display
+def show_execute_controls(bisection_display):
+    bisection_display
     return
 
 
 @app.cell
-def run_bisection_process(
-    process_area,
-    run_button,
-    selected_bounds,
-    test_date,
-):
-    run_button  # Create dependency
+def bisection_execution_helpers():
+    """Helper functions for bisection execution."""
+    def initialize_counters():
+        """Initialize counter lists for bisection algorithm."""
+        return {
+            'api_call_counter': [0],
+            'cache_hits': [0],
+            'results_buffer': []
+        }
 
-    if run_button.value:
+    def print_bisection_header(date, bounds):
+        """Print header for bisection execution."""
         print("Starting bisection algorithm (with caching & individual crime tracking)...")
-        print(f"Date: {test_date.value}")
-        print(f"Bounds: {selected_bounds}")
+        print(f"Date: {date}")
+        print(f"Bounds: {bounds}")
         print("-" * 60)
 
-        # Initialize counters
-        api_call_counter = [0]
-        cache_hits = [0]
-        results_buffer = []  # Kept for compatibility but not used for batch commits
+    def print_bisection_summary(results, api_calls, cache_hits):
+        """Print summary statistics after bisection completes."""
+        print("-" * 60)
+        print(f"Completed! Found {len(results)} areas in target range.")
+        print(f"Total API calls made: {api_calls}")
+        print(f"Cache hits: {cache_hits} (avoided {cache_hits} API calls)")
 
+        if api_calls + cache_hits > 0:
+            cache_rate = cache_hits / (api_calls + cache_hits) * 100
+            print(f"Cache hit rate: {cache_rate:.1f}%")
+    return initialize_counters, print_bisection_header, print_bisection_summary
+
+
+@app.cell
+def bisection_executor_function():
+    """Wrapper for bisection execution logic."""
+    def execute_bisection_algorithm(process_area, selected_bounds, test_date, counters):
+        """
+        Execute the bisection algorithm with given parameters.
+
+        Args:
+            process_area: The bisection algorithm function
+            selected_bounds: Dictionary with north, south, east, west keys
+            test_date: Date string in YYYY-MM format
+            counters: Dictionary with api_call_counter, cache_hits, results_buffer
+
+        Returns:
+            List of (polygon_coords, crime_count) tuples
+        """
         results = process_area(
             north=selected_bounds["north"],
             south=selected_bounds["south"],
             east=selected_bounds["east"],
             west=selected_bounds["west"],
-            date=test_date.value,
-            api_call_counter=api_call_counter,
-            results_buffer=results_buffer,
-            cache_hits=cache_hits,
+            date=test_date,
+            api_call_counter=counters['api_call_counter'],
+            results_buffer=counters['results_buffer'],
+            cache_hits=counters['cache_hits'],
+        )
+        return results
+    return (execute_bisection_algorithm,)
+
+
+@app.cell
+def run_bisection_process(
+    execute_bisection_algorithm,
+    initialize_counters,
+    print_bisection_header,
+    print_bisection_summary,
+    process_area,
+    run_button,
+    selected_bounds,
+    test_date,
+):
+    """Main orchestrator for bisection execution."""
+    run_button  # Create dependency
+
+    if run_button.value:
+        # Initialize
+        counters = initialize_counters()
+
+        # Print header
+        print_bisection_header(test_date.value, selected_bounds)
+
+        # Execute bisection
+        results = execute_bisection_algorithm(
+            process_area,
+            selected_bounds,
+            test_date.value,
+            counters
         )
 
-        print("-" * 60)
-        print(f"Completed! Found {len(results)} areas in target range.")
-        print(f"Total API calls made: {api_call_counter[0]}")
-        print(f"Cache hits: {cache_hits[0]} (avoided {cache_hits[0]} API calls)")
-        if api_call_counter[0] + cache_hits[0] > 0:
-            cache_rate = cache_hits[0] / (api_call_counter[0] + cache_hits[0]) * 100
-            print(f"Cache hit rate: {cache_rate:.1f}%")
+        # Print summary
+        print_bisection_summary(
+            results,
+            counters['api_call_counter'][0],
+            counters['cache_hits'][0]
+        )
+
+        # Store results
         bisection_results = results
-        total_api_calls = api_call_counter[0]
-        total_cache_hits = cache_hits[0]
+        total_api_calls = counters['api_call_counter'][0]
+        total_cache_hits = counters['cache_hits'][0]
     else:
         bisection_results = []
         total_api_calls = 0
@@ -754,38 +814,55 @@ def run_bisection_process(
 
 
 @app.cell
-def visualize_results(
-    bisection_results,
-    folium,
-    mo,
-    show_boundaries,
-    total_api_calls,
-    total_cache_hits,
-    uk_boundary_polygon,
-):
-    if len(bisection_results) == 0:
-        output = mo.md("**No results yet.** Run the bisection algorithm to see visualizations.")
-    else:
-        # Calculate center point for map
+def map_helper_functions(folium):
+    """Helper functions for map creation and manipulation."""
+    def calculate_map_center(bisection_results):
+        """Calculate center point from bisection results."""
         all_lats = [coord[0] for coords, _ in bisection_results for coord in coords]
         all_lons = [coord[1] for coords, _ in bisection_results for coord in coords]
-
         center_lat = (max(all_lats) + min(all_lats)) / 2
         center_lon = (max(all_lons) + min(all_lons)) / 2
+        return center_lat, center_lon
 
-        # Create folium map centered on data
-        m = folium.Map(
+    def create_base_map(center_lat, center_lon, zoom_start=8):
+        """Create a folium map centered on given coordinates."""
+        return folium.Map(
             location=[center_lat, center_lon],
-            zoom_start=8,
+            zoom_start=zoom_start,
             tiles='OpenStreetMap'
         )
+    return calculate_map_center, create_base_map
 
-        # Conditionally add UK boundary polygon in red (reference outline)
-        if show_boundaries.value:
-            # Handle both Polygon and MultiPolygon types
-            if uk_boundary_polygon.geom_type == 'Polygon':
-                # Single polygon - extract exterior coordinates
-                uk_boundary_coords_list = list(uk_boundary_polygon.exterior.coords)
+
+@app.cell
+def boundary_rendering_functions(folium):
+    """Functions for rendering UK boundary on map."""
+    def add_uk_boundary_to_map(map_obj, uk_boundary_polygon):
+        """
+        Add UK boundary polygon to folium map.
+
+        Args:
+            map_obj: Folium map object
+            uk_boundary_polygon: Shapely Polygon or MultiPolygon
+        """
+        if uk_boundary_polygon.geom_type == 'Polygon':
+            # Single polygon
+            uk_boundary_coords_list = list(uk_boundary_polygon.exterior.coords)
+            uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
+
+            folium.Polygon(
+                locations=uk_boundary_latlon,
+                color='red',
+                weight=3,
+                fill=False,
+                opacity=0.8,
+                popup='UK Boundary (excludes Republic of Ireland)',
+                tooltip='UK Territory Boundary'
+            ).add_to(map_obj)
+        else:
+            # MultiPolygon - iterate through all constituent polygons
+            for geom in uk_boundary_polygon.geoms:
+                uk_boundary_coords_list = list(geom.exterior.coords)
                 uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
 
                 folium.Polygon(
@@ -796,35 +873,27 @@ def visualize_results(
                     opacity=0.8,
                     popup='UK Boundary (excludes Republic of Ireland)',
                     tooltip='UK Territory Boundary'
-                ).add_to(m)
-            else:
-                # MultiPolygon - iterate through all constituent polygons
-                for geomi in uk_boundary_polygon.geoms:
-                    uk_boundary_coords_list = list(geomi.exterior.coords)
-                    uk_boundary_latlon = [[lat, lon] for lon, lat in uk_boundary_coords_list]
+                ).add_to(map_obj)
+    return (add_uk_boundary_to_map,)
 
-                    folium.Polygon(
-                        locations=uk_boundary_latlon,
-                        color='red',
-                        weight=3,
-                        fill=False,
-                        opacity=0.8,
-                        popup='UK Boundary (excludes Republic of Ireland)',
-                        tooltip='UK Territory Boundary'
-                    ).add_to(m)
 
-        # Calculate crime counts for statistics
-        crime_counts = [count for _, count in bisection_results]
-        min_crimes = min(crime_counts)
-        max_crimes = max(crime_counts)
+@app.cell
+def area_rendering_functions(folium):
+    """Functions for rendering bisected areas on map."""
+    # Polygon styling constants
+    POLYGON_COLOR = '#3388ff'      # Blue border
+    POLYGON_FILL_COLOR = '#3388ff' # Blue fill
+    POLYGON_OPACITY = 0.3          # 30% fill opacity
+    POLYGON_WEIGHT = 2             # 2px border width
 
-        # Uniform styling for all polygons
-        POLYGON_COLOR = '#3388ff'      # Blue border
-        POLYGON_FILL_COLOR = '#3388ff' # Blue fill
-        POLYGON_OPACITY = 0.3          # 30% fill opacity
-        POLYGON_WEIGHT = 2             # 2px border width
+    def add_area_polygons_to_map(map_obj, bisection_results):
+        """
+        Add bisected area polygons to folium map.
 
-        # Add each bisected area as a polygon
+        Args:
+            map_obj: Folium map object
+            bisection_results: List of (polygon_coords, crime_count) tuples
+        """
         # Start enumeration at 1 to match database area_id
         for idx, (polygon_coords, crime_count) in enumerate(bisection_results, start=1):
             # Convert to list of [lat, lon] for folium
@@ -849,31 +918,82 @@ def visualize_results(
                     max_width=300
                 ),
                 tooltip=f"Area {idx}: {crime_count:,} crimes"
-            ).add_to(m)
+            ).add_to(map_obj)
+    return (add_area_polygons_to_map,)
 
-        # Display statistics
-        total_crimes = sum(crime_counts)
-        avg_crimes = total_crimes / len(crime_counts)
 
-        # Calculate cache rate
+@app.cell
+def statistics_functions():
+    """Functions for calculating and formatting statistics."""
+    def calculate_crime_statistics(bisection_results):
+        """Calculate statistics from bisection results."""
+        crime_counts = [count for _, count in bisection_results]
+        return {
+            'crime_counts': crime_counts,
+            'total_crimes': sum(crime_counts),
+            'avg_crimes': sum(crime_counts) / len(crime_counts),
+            'min_crimes': min(crime_counts),
+            'max_crimes': max(crime_counts),
+            'total_areas': len(bisection_results)
+        }
+
+    def format_statistics_markdown(stats, total_api_calls, total_cache_hits):
+        """Format statistics as markdown string."""
         total_checks = total_api_calls + total_cache_hits
-        cache_rat = (total_cache_hits / total_checks * 100) if total_checks > 0 else 0
+        cache_rate = (total_cache_hits / total_checks * 100) if total_checks > 0 else 0
 
-        stats = mo.md(f"""
+        return f"""
         ### Results Summary
 
-        - **Total Areas**: {len(bisection_results)}
-        - **Total Crimes**: {total_crimes:,}
-        - **Average Crimes per Area**: {avg_crimes:.0f}
-        - **Min Crimes**: {min_crimes}
-        - **Max Crimes**: {max_crimes}
+        - **Total Areas**: {stats['total_areas']}
+        - **Total Crimes**: {stats['total_crimes']:,}
+        - **Average Crimes per Area**: {stats['avg_crimes']:.0f}
+        - **Min Crimes**: {stats['min_crimes']}
+        - **Max Crimes**: {stats['max_crimes']}
         - **API Calls Made**: {total_api_calls}
-        - **Cache Hits**: {total_cache_hits} ({cache_rat:.1f}% cache hit rate)
+        - **Cache Hits**: {total_cache_hits} ({cache_rate:.1f}% cache hit rate)
 
         **Map**: Blue polygons show bisected areas. Click for details, hover for quick stats.
-        """)
+        """
+    return calculate_crime_statistics, format_statistics_markdown
 
-        output = mo.vstack([stats, mo.Html(m._repr_html_())])
+
+@app.cell
+def visualize_results(
+    add_area_polygons_to_map,
+    add_uk_boundary_to_map,
+    bisection_results,
+    calculate_crime_statistics,
+    calculate_map_center,
+    create_base_map,
+    format_statistics_markdown,
+    mo,
+    show_boundaries,
+    total_api_calls,
+    total_cache_hits,
+    uk_boundary_polygon,
+):
+    """Main visualization orchestrator function."""
+    if len(bisection_results) == 0:
+        output = mo.md("**No results yet.** Run the bisection algorithm to see visualizations.")
+    else:
+        # Create map
+        center_lat, center_lon = calculate_map_center(bisection_results)
+        m = create_base_map(center_lat, center_lon)
+
+        # Add UK boundary if requested
+        if show_boundaries.value:
+            add_uk_boundary_to_map(m, uk_boundary_polygon)
+
+        # Add area polygons
+        add_area_polygons_to_map(m, bisection_results)
+
+        # Calculate and format statistics
+        stats = calculate_crime_statistics(bisection_results)
+        stats_md = format_statistics_markdown(stats, total_api_calls, total_cache_hits)
+
+        # Combine into output
+        output = mo.vstack([mo.md(stats_md), mo.Html(m._repr_html_())])
     return (output,)
 
 
@@ -918,6 +1038,282 @@ def _(df_crimes):
 
 @app.cell
 def _():
+    return
+
+
+app._unparsable_cell(
+    r"""
+    \"> There is still an issue witht he visualize_results cell
+    \"\"Functions for loading existing areas and processing historical data.\"\"\"
+    def load_existing_areas(base_date=None):
+        \"\"\"
+        Load existing area polygons from the database.
+
+        Args:
+            base_date: Optional date to filter areas (YYYY-MM format)
+                      If None, loads all unique polygons
+
+        Returns:
+            List of tuples: [(area_id, polygon_str, base_crime_count), ...]
+        \"\"\"
+        if base_date:
+            cursor.execute(
+                \"\"\"SELECT id, polygon, crime_count
+                   FROM crime_areas
+                   WHERE date = ?
+                   ORDER BY id\"\"\",
+                (base_date,)
+            )
+        else:
+            # Get unique polygons (take first occurrence of each)
+            cursor.execute(
+                \"\"\"SELECT id, polygon, crime_count
+                   FROM crime_areas
+                   GROUP BY polygon
+                   ORDER BY id\"\"\"
+            )
+
+        areas = cursor.fetchall()
+        return areas
+
+    def generate_month_range(start_date, end_date):
+        \"\"\"
+        Generate list of months between start_date and end_date (inclusive).
+
+        Args:
+            start_date: Start date in YYYY-MM format
+            end_date: End date in YYYY-MM format
+
+        Returns:
+            List of date strings: ['2024-01', '2024-02', ...]
+        \"\"\"
+        start_year, start_month = map(int, start_date.split('-'))
+        end_year, end_month = map(int, end_date.split('-'))
+
+        months = []
+        current_year = start_year
+        current_month = start_month
+
+        while (current_year < end_year) or (current_year == end_year and current_month <= end_month):
+            months.append(f\"{current_year:04d}-{current_month:02d}\")
+            current_month += 1
+            if current_month > 12:
+                current_month = 1
+                current_year += 1
+
+        return months
+    """,
+    name="historical_data_functions"
+)
+
+
+@app.cell
+def historical_crime_fetcher(conn, cursor, fetch_crimes, insert_crimes_batch):
+    """Fetch historical crime data for existing areas."""
+    def fetch_historical_crimes(areas, date, progress_callback=None):
+        """
+        Fetch crimes for all areas for a specific date.
+
+        Args:
+            areas: List of (area_id, polygon_str, crime_count) tuples
+            date: Date string in YYYY-MM format
+            progress_callback: Optional function to call with progress updates
+
+        Returns:
+            Dictionary with statistics
+        """
+        total_areas = len(areas)
+        successful = 0
+        failed = 0
+        total_crimes_inserted = 0
+
+        for idx, (area_id, polygon_str, _) in enumerate(areas, start=1):
+            # Convert polygon string back to coords for API
+            # Format: "lat1,lon1:lat2,lon2:..."
+            polygon_coords = []
+            for pair in polygon_str.split(':'):
+                lat, lon = pair.split(',')
+                polygon_coords.append((float(lat), float(lon)))
+
+            # Fetch crimes from API
+            status_code, data, crime_count = fetch_crimes(polygon_coords, date)
+
+            if status_code == 200:
+                # Check if this area/date already exists in crime_areas
+                cursor.execute(
+                    """SELECT id FROM crime_areas
+                       WHERE polygon = ? AND date = ?""",
+                    (polygon_str, date)
+                )
+                result = cursor.fetchone()
+
+                if result:
+                    # Area/date exists, use existing area_id
+                    existing_area_id = result[0]
+                    area_id_to_use = existing_area_id
+                else:
+                    # Insert new area/date record
+                    cursor.execute(
+                        """INSERT INTO crime_areas (polygon, crime_count, date)
+                           VALUES (?, ?, ?)""",
+                        (polygon_str, crime_count, date)
+                    )
+                    area_id_to_use = cursor.lastrowid
+
+                # Insert individual crimes
+                crimes_inserted = insert_crimes_batch(area_id_to_use, data)
+                total_crimes_inserted += crimes_inserted
+                successful += 1
+
+                conn.commit()
+
+                if progress_callback:
+                    progress_callback(idx, total_areas, area_id, crime_count, crimes_inserted)
+            else:
+                failed += 1
+                if progress_callback:
+                    progress_callback(idx, total_areas, area_id, 0, 0, error=status_code)
+
+        return {
+            'total_areas': total_areas,
+            'successful': successful,
+            'failed': failed,
+            'total_crimes': total_crimes_inserted
+        }
+    return (fetch_historical_crimes,)
+
+
+@app.cell
+def historical_ui_controls(mo):
+    """UI controls for historical data collection."""
+
+    historical_start_date = mo.ui.text(
+        value="2024-01",
+        label="Start Date (YYYY-MM)"
+    )
+
+    historical_end_date = mo.ui.text(
+        value="2024-01",
+        label="End Date (YYYY-MM)"
+    )
+
+    base_date_for_areas = mo.ui.text(
+        value="2024-01",
+        label="Base Date (areas to use)"
+    )
+
+    historical_run_button = mo.ui.run_button(
+        label="Fetch Historical Crime Data"
+    )
+
+    historical_display = mo.vstack([
+        mo.md("""
+        ## Historical Data Collection
+
+        Use existing areas from the database to fetch crime data for multiple months.
+
+        **Instructions:**
+        1. **Base Date**: The date of the bisection run (which areas to use)
+        2. **Start Date**: First month to fetch
+        3. **End Date**: Last month to fetch (inclusive)
+        4. Click "Fetch Historical Crime Data" to begin
+
+        **Note**: This will fetch crimes for ALL areas for each month in the range.
+        """),
+        base_date_for_areas,
+        historical_start_date,
+        historical_end_date,
+        historical_run_button
+    ])
+    return (
+        base_date_for_areas,
+        historical_display,
+        historical_end_date,
+        historical_run_button,
+        historical_start_date,
+    )
+
+
+@app.cell
+def show_historical_controls(historical_display):
+    historical_display
+    return
+
+
+@app.cell
+def run_historical_collection(
+    base_date_for_areas,
+    fetch_historical_crimes,
+    generate_month_range,
+    historical_end_date,
+    historical_run_button,
+    historical_start_date,
+    load_existing_areas,
+):
+    """Execute historical data collection."""
+    historical_run_button  # Create dependency
+
+    if historical_run_button.value:
+        print("=" * 70)
+        print("HISTORICAL CRIME DATA COLLECTION")
+        print("=" * 70)
+
+        # Load existing areas
+        print(f"\nLoading areas from base date: {base_date_for_areas.value}")
+        areas = load_existing_areas(base_date_for_areas.value)
+        print(f"✓ Loaded {len(areas)} areas")
+
+        if len(areas) == 0:
+            print("⚠ No areas found! Run bisection algorithm first.")
+        else:
+            # Generate date range
+            print(f"\nGenerating date range: {historical_start_date.value} to {historical_end_date.value}")
+            months = generate_month_range(
+                historical_start_date.value,
+                historical_end_date.value
+            )
+            print(f"✓ Will process {len(months)} month(s): {', '.join(months)}")
+
+            # Process each month
+            total_stats = {
+                'months_processed': 0,
+                'total_crimes': 0,
+                'total_api_calls': 0
+            }
+
+            for month in months:
+                print(f"\n{'─' * 70}")
+                print(f"Processing: {month}")
+                print(f"{'─' * 70}")
+
+                def progress(idx, total, area_id, crime_count, crimes_inserted, error=None):
+                    if error:
+                        print(f"  [{idx}/{total}] Area {area_id} - ⚠ Error {error}")
+                    else:
+                        print(f"  [{idx}/{total}] Area {area_id} - {crime_count} crimes, {crimes_inserted} inserted")
+
+                month_stats = fetch_historical_crimes(areas, month, progress)
+
+                print(f"\n✓ {month} Complete:")
+                print(f"  - Successful: {month_stats['successful']}/{month_stats['total_areas']}")
+                print(f"  - Failed: {month_stats['failed']}")
+                print(f"  - Total crimes inserted: {month_stats['total_crimes']:,}")
+
+                total_stats['months_processed'] += 1
+                total_stats['total_crimes'] += month_stats['total_crimes']
+                total_stats['total_api_calls'] += month_stats['total_areas']
+
+            print(f"\n{'═' * 70}")
+            print("COLLECTION COMPLETE")
+            print(f"{'═' * 70}")
+            print(f"Months processed: {total_stats['months_processed']}")
+            print(f"Total API calls: {total_stats['total_api_calls']:,}")
+            print(f"Total crimes inserted: {total_stats['total_crimes']:,}")
+            print(f"{'═' * 70}")
+
+            historical_stats = total_stats
+    else:
+        historical_stats = None
     return
 
 
